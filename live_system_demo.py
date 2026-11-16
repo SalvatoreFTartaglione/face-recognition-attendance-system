@@ -1,214 +1,283 @@
+"""
+End-to-end attendance pipeline used by the live demo (notebook or command line).
+
+    acquisition (<= 3 samples) -> face detection (MTCNN) -> [liveness check]
+    -> quality gate (MagFace) -> embedding (InceptionResnetV1-VGGFace2)
+    -> Enrollment | Identification (1:N, open set) | Verification (1:1)
+
+Command-line usage:
+    python live_system_demo.py identify --data-dir Test/new_user
+    python live_system_demo.py verify   --data-dir Test/new_user --claimed-id 3
+    python live_system_demo.py enroll   --data-dir Test/new_user --name new_user --no-liveness
+"""
+import argparse
+import os
 import time
+
 import numpy as np
-import os
-import cv2
-import joblib
 from sklearn.preprocessing import normalize
-from sklearn.utils import Bunch
+from torch.utils.data import DataLoader
+
 import face_detection as detector
-import utilities as utils
+import face_quality
+import liveness_detector
 import threshold_tuning as th_tuning
-import liveness_detector as liveness_detector
-import os
-import sys
-import torch
-import numpy as np
-from torch.utils.data import Dataset, DataLoader
-import matplotlib.pyplot as plt
-from sklearn.preprocessing import normalize
-
-
-# Custom libraries imports
-import face_detection as detector
 import utilities as utils
-import threshold_tuning as th_tuning
-import liveness_detector as liveness_detector
-import face_quality 
+
+# Operating points calibrated in BBA_Project_G14.ipynb (see README, "Results").
+DEFAULT_CONFIG = {
+    "Tf": 0.5000,                      # liveness threshold
+    "Ti": 0.6833,                      # identification threshold
+    "Tv": 0.6013,                      # verification threshold
+    "quality_threshold": 20.264,       # MagFace quality threshold
+    "max_samples": 3,                  # at most 3 acquisitions per session (system requirement)
+    "detector": "MTCNN",
+    "embedding_model": "InceptionResnetV1-VGGFace2",
+    "batch_size": 32,
+    "model_dir": "Models",
+    "liveness_model_name": "liveness_model.pth",
+    "magface_model_name": "magface_iresnet50_MS1MV2_ddp_fp32.pth",
+    "database_dir": "System_Database/gallery",
+    "gallery_name": "gallery.npy",
+}
 
 
-def verify_liveness(data_dir, detector_method, liveness_model, device, batch_size, Tf):
-    """  
-    Verify liveness of detected faces in the given data directory using the provided liveness detection model.
-    Removes non-live faces from the dataset.
-    Parameters:
-    - data_dir (str): Directory containing the images to be processed.
-    - detector_method (object): Face detection method to be used.
-    - liveness_model (torch.nn.Module): Pre-trained liveness detection model.
-    - device (torch.device): Device to run the model on (CPU or GPU).
-    - batch_size (int): Batch size for DataLoader.
-    - Tf (float): Threshold for liveness classification.
+class AcquisitionError(Exception):
+    """Raised when no usable sample is available: the user must re-acquire."""
+
+
+def _show_faces(faces, title):
+    import matplotlib.pyplot as plt
+    n = len(faces.images)
+    plt.figure(figsize=(3 * n, 3.4))
+    for k in range(n):
+        plt.subplot(1, n, k + 1)
+        plt.imshow(np.clip(np.asarray(faces.images[k], dtype=np.float32), 0, 1))
+        plt.title(os.path.basename(str(faces.paths[k])), fontsize=8)
+        plt.axis('off')
+    plt.suptitle(title); plt.tight_layout(); plt.show()
+
+
+# ---------------------------------------------------------------------------
+# Pipeline stages
+# ---------------------------------------------------------------------------
+def acquire_and_detect(data_dir, detector_method, max_samples, cnn):
+    """Loads at most `max_samples` acquisitions and detects the face in each of them."""
+    samples = utils.load_demo_data(data_dir, max_samples=max_samples, verbose=True)
+    if len(samples.images) == 0:
+        raise AcquisitionError(f"No images found in '{data_dir}'.")
+    faces = detector.detect_faces(samples, method=detector_method, verbose=True, cnn=cnn)
+    if len(faces.images) == 0:
+        raise AcquisitionError("No face detected in the acquired samples.")
+    return faces
+
+
+def verify_liveness(faces_chw, liveness_model, device, batch_size, Tf):
+    """
+    Replay-attack check on CHW face crops. Fake samples are discarded.
+    Returns the live faces in HWC format with their liveness scores.
+    """
+    loader = DataLoader(liveness_detector.LivenessDatasetWrapper(faces_chw), batch_size=batch_size, shuffle=False)
+    live = liveness_detector.filter_non_live_faces(faces_chw, loader, liveness_model, device, Tf, verbose=True)
+    if len(live.images) == 0:
+        raise AcquisitionError("All samples were classified as FAKE (presentation attack suspected).")
+    return live
+
+
+def quality_gate(faces, magface, quality_threshold, device):
+    """Keeps only the samples above the MagFace quality threshold (best first)."""
+    accepted = face_quality.select_samples_by_quality(magface, faces, quality_threshold, device, verbose=True)
+    if len(accepted.images) == 0:
+        best = np.nanmax(accepted.all_quality_scores) if np.any(~np.isnan(accepted.all_quality_scores)) else float('nan')
+        raise AcquisitionError(f"No sample reached the quality threshold ({quality_threshold:.3f}, best score: "
+                               f"{best:.3f}). Please re-acquire in better conditions (lighting, pose, focus).")
+    return accepted
+
+
+def extract_embeddings(faces, model_name, device, batch_size):
+    """L2-normalised embeddings of the given faces, shape (n, 512)."""
+    return normalize(utils.preprocess_and_embed(faces, model_name, device, batch_size), norm='l2')
+
+
+# ---------------------------------------------------------------------------
+# Operating modes
+# ---------------------------------------------------------------------------
+def enroll_new_user(new_embeddings, new_name, gallery_path="gallery.npy", database_dir="./database/gallery"):
+    """
+    Appends a new user to the gallery, storing the features (never the images)
+    of ALL the accepted samples. Creates the gallery if it does not exist.
+
     Returns:
-    - filtered_test (Bunch): Bunch object containing only live faces after filtering.
-    - processd_filtered_test (Bunch): Bunch object containing processed data of live faces.
+        int: the ID assigned to the new user.
     """
-    
-    #########################
-    # REMOVE NON LIVE FACES #
-    #########################
-    # 1. Download/Load the paths (evaluation needs just the paths)
-    test_data_paths = utils.download_demo_data_paths(data_dir)
-    # 2. Process/Detect Faces 
-    processed_test = detector.detect_faces(test_data_paths, method=detector_method, verbose=False, cnn=True)
-    if processed_test.images.shape[0] == 0:
-            print("No faces detected. Exiting the system.")
-            sys.exit()
-    # 3. Wrap & Load
-    test_ds = liveness_detector.LivenessDatasetWrapper(processed_test)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
-    # 4. Filter: Remove Fake Faces
-    processd_filtered_test, filtered_test = liveness_detector.filter_non_live_faces(processed_test, test_data_paths, test_loader, liveness_model, device, Tf, verbose=True)
-    if processd_filtered_test.images.shape[0] == 0:
-        print("No live faces detected. Exiting the system.")
-        sys.exit()
-    # 5. Visualize only live faces
-    print(f"\n{'='*50}  LIVE FACES DETECTED {'='*50}\n")
-    #utils.visualize_detected_faces(processd_filtered_test, n_cols=processd_filtered_test.images.shape[0])
-    
-    return processd_filtered_test, filtered_test
-
-
-
-
-
-def check_faces_and_extract_embedding(processed_filtered_test, filtered_test, model, device, batch_size, magface, img_quality_threshold):
-    """
-    Detects faces in the input images and extracts their embeddings using the specified model.
-
-    Parameters:
-    - filtered_test: The input images after liveness filtering.
-    - detector_method: The face detection method to use.
-    - model: The face embedding model.
-    - device: The device to run the computations on (CPU or GPU).
-    - batch_size: The batch size for processing.
-    - magface: The MagFace quality assessment utility.
-    - img_quality_threshold: The minimum quality score to consider a face valid using magface.
-    Returns:
-    - embedding_norm: The normalized embeddings of the detected faces.
-    """
-    utils.visualize_detected_faces(processed_filtered_test, n_cols=processed_filtered_test.images.shape[0])
-    # 1. Select the single Best Quality Face
-    processed_filtered_test = face_quality.quality_check_magface(magface, filtered_test, processed_filtered_test, verbose=False, device=device, img_quality_threshold=img_quality_threshold)
-    
-    # 2. Visualize the selected face
-    face = np.array(processed_filtered_test['images'][0])
-    face = face.astype(np.float32)
-    plt.imshow(face)
-    plt.axis('off')
-    plt.show()
-    # 4. Preprocess & Extract Embedding
-    embedding = utils.preprocess_and_embed(processed_filtered_test, model, device, batch_size, verbose=False)
-    # 5 Normalize the embedding
-    embedding_norm = normalize(embedding, norm='l2')
-    
-    return embedding_norm
-
-
-
-
-def enroll_new_user(new_embedding, new_name, gallery_path="gallery.npy", database_dir="./database/gallery"):
-    """
-    Loads the existing .npy gallery, appends the new user, and saves it back.
-    If no gallery exists, creates a new one with the first user. 
-    Parameters:
-    - new_embedding (np.ndarray): The normalized embedding of the new user to enroll.
-    - new_name (str): The name of the new user to enroll.
-    - gallery_path (str): The filename of the gallery file.
-    - database_dir (str): The directory where the gallery is stored.
-    Returns:
-    - None
-    """
-    print(f"\n{'='*50}  ENROLLMENT MODE {'='*50}\n")    
+    new_embeddings = np.atleast_2d(new_embeddings)
     full_path = os.path.join(database_dir, gallery_path)
-    # Ensure directory exists
-    os.makedirs(database_dir, exist_ok=True)
-    # 1. Load Existing or Create New
+
     if os.path.exists(full_path):
-        # Load using the new dictionary-based loader
-        try:
-            current_embs, current_labels, current_names = utils.load_gallery(gallery_path, database_dir)
-        except Exception as e:
-            print(f"Error loading gallery: {e}")
-            return
-
-        # Check if user already exists
+        current_embs, current_labels, current_names = utils.load_gallery(gallery_path, database_dir)
         if new_name in current_names:
-            # Find the ID of the existing user
-            existing_label = np.where(current_names == new_name)[0][0]
-            raise Exception(f"User '{new_name}' already exists (ID: {existing_label}).\nENROLLMENT SKIPPED (Duplicate).")
-            
-        else:
-            # Create new ID
-            new_label = len(current_names)
-            # Append new name
-            current_names = np.append(current_names, new_name)
-            print(f"New User '{new_name}' assigned ID: {new_label}.")
-            
-        # 2. Append New Data
-        # Ensure new embedding is (1, 512)
-        new_embedding = new_embedding.reshape(1, -1)
-        # Stack embeddings
-        updated_embs = np.vstack((current_embs, new_embedding))
-        # Append label
-        updated_labels = np.append(current_labels, new_label)
-        # 3. Save back to disk
-        utils.create_gallery(updated_embs, updated_labels, current_names, filename=gallery_path, database_dir=database_dir, verbose=False)
-        print(f"Enrollment Completed for '{new_name}'.")
-        
+            existing = int(np.where(current_names == new_name)[0][0])
+            raise ValueError(f"User '{new_name}' already exists (ID: {existing}). Enrollment skipped.")
+        new_label = len(current_names)
+        embs = np.vstack((current_embs, new_embeddings))
+        labels = np.append(current_labels, [new_label] * len(new_embeddings))
+        names = np.append(current_names, new_name)
     else:
-        # No gallery exists - create a new one with the first user
-        print(f"No existing gallery found at {full_path}.")
-        print(f"Creating new gallery with first user '{new_name}'...")
-        new_embedding = new_embedding.reshape(1, -1)  # (1, 512)
-        new_labels = np.array([0])      # First user gets ID 0
-        new_names = np.array([new_name])
-        utils.create_gallery(new_embedding, new_labels, new_names, filename=gallery_path, database_dir=database_dir, verbose=False)    
-        print(f"Enrollment Complete. New gallery created.")
+        new_label = 0
+        embs, labels, names = new_embeddings, np.zeros(len(new_embeddings), dtype=int), np.array([new_name])
 
-
-
+    utils.create_gallery(embs, labels, names, filename=gallery_path, database_dir=database_dir)
+    print(f"Enrollment completed: '{new_name}' -> ID {new_label} ({len(new_embeddings)} template(s) stored).")
+    return new_label
 
 
 def verify_user(embedding_norm, Tv, claimed_id, gallery_name, database_dir):
     """
-    Verifies the user by comparing the provided embedding against the gallery.
-    Parameters:
-    - embedding_norm (np.ndarray): The normalized embedding of the user to verify.
-    - Tv (float): The verification threshold.
-    - claimed_id (int): The ID claimed by the user.
-    - gallery_name (str): The name of the gallery file.
-    - database_dir (str): The directory where the gallery is stored.
+    1:1 verification against the templates of the claimed identity only.
+
     Returns:
-    - None
+        tuple: (score, decision) with decision in {"MATCH", "REJECT"}.
     """
-    print(f"\n{'='*50}  VERIFICATION MODE {'='*50}\n")
-    # 0. Load embedding from gallery
+    gal_embs, gal_labels, gal_names = utils.load_gallery(filename=gallery_name, gallery_path=database_dir)
+    score, decision = th_tuning.verify_user(claimed_id, embedding_norm, gal_embs, gal_labels, Tv)
+    claimed_name = gal_names[claimed_id] if claimed_id < len(gal_names) else f"ID_{claimed_id}"
+    print(f"Claimed identity: ID {claimed_id} ({claimed_name})")
+    print(f"Matching score:   {score:.4f} (Tv = {Tv:.4f})")
+    print(f">> {decision}")
+    return score, decision
+
+
+def identify_user(embedding_norm, gallery_name, database_dir, Ti):
+    """
+    1:N open-set identification.
+
+    Returns:
+        list of {"id", "name", "score"} above Ti, best first (empty = unknown user, rejected).
+    """
     gal_embs, gal_labels, gal_names = utils.load_gallery(filename=gallery_name, gallery_path=database_dir)
     if len(gal_embs) == 0:
-        print("Error: Gallery is empty. Cannot perform identification.")
-        sys.exit()
-    # 1. Verify User
-    _, _ = th_tuning.compute_far_frr_verification_on_probes(Tv, embedding_norm, [claimed_id], gal_embs, gal_labels, live_demo=True)
-    
-    
-    
-    
-    
-    
-def identify_user(embedding_norm, gallery_name, database_dir, Ti, verbose=False):
-    print(f"\n{'='*50}  IDENTIFICATION MODE {'='*50}\n")   
-    # 0. Load embedding from gallery
-    gal_embs, gal_labels, gal_names = utils.load_gallery(filename=gallery_name, gallery_path=database_dir)
-    if len(gal_embs) == 0:
-        print("Error: Gallery is empty. Cannot perform identification.")
-        sys.exit()
-    # 1. Identify User
-    result, name, dist = th_tuning.identify_user(embedding_norm, gal_embs, gal_labels, gal_names, threshold=Ti)
-    # 2. Display Result
-    if verbose:
-        print(f"Closest Match: {name}")
-        print(f"Similarity:      {dist:.4f}")
-        print(f"Threshold:     {Ti:.4f}")
-    if result is False:
-        print(">> ACCESS DENIED User not recognized")
+        raise ValueError("Gallery is empty: enroll at least one user first.")
+    candidates = th_tuning.rank_candidates(embedding_norm, gal_embs, gal_labels, gal_names, Ti)
+    if not candidates:
+        print(f">> ACCESS DENIED: user not recognized (no score >= Ti = {Ti:.4f})")
     else:
-        print(f">> ACCESS GRANTED: Welcome, {name}!")
+        print(f"Candidates above Ti = {Ti:.4f}:")
+        for rank, c in enumerate(candidates, 1):
+            print(f"  {rank}. ID {c['id']:>3} {c['name']:<20} score={c['score']:.4f}")
+        print(f">> ACCESS GRANTED: Welcome, {candidates[0]['name']}!")
+    return candidates
+
+
+# ---------------------------------------------------------------------------
+# Session orchestration
+# ---------------------------------------------------------------------------
+def run_session(mode, data_dir, embedding_model, device, magface, liveness_model=None, use_liveness=True,
+                user_name=None, claimed_id=None, config=None, show=False):
+    """
+    Runs a complete attendance session.
+
+    Args:
+        mode: "Enrollment", "Identification" or "Verification".
+        data_dir: Folder with the acquired samples (at most `max_samples` are used).
+        embedding_model: Name of the feature extractor.
+        device: Torch device.
+        magface: MagFaceEvaluator (quality gate).
+        liveness_model: Trained liveness model (required if use_liveness=True).
+        use_liveness: Activate/deactivate the replay-attack detector.
+        user_name: Name of the new user (Enrollment).
+        claimed_id: Claimed identity (Verification).
+        config: Overrides of DEFAULT_CONFIG.
+        show: Display the faces at each stage (notebook use).
+
+    Returns:
+        dict with the mode result and the per-stage processing times (seconds).
+        Raises AcquisitionError when the sample(s) must be re-acquired.
+    """
+    cfg = {**DEFAULT_CONFIG, **(config or {})}
+    timings = {}
+    t0 = time.perf_counter()
+
+    # 1. Acquisition + detection (CHW crops when they go through the liveness CNN)
+    faces = acquire_and_detect(data_dir, cfg["detector"], cfg["max_samples"], cnn=use_liveness)
+    timings["detection"] = time.perf_counter() - t0
+
+    # 2. Liveness (optional)
+    if use_liveness:
+        if liveness_model is None:
+            raise ValueError("use_liveness=True requires a liveness model.")
+        t = time.perf_counter()
+        faces = verify_liveness(faces, liveness_model, device, cfg["batch_size"], cfg["Tf"])
+        timings["liveness"] = time.perf_counter() - t
+    else:
+        print("\nLiveness detection is disabled.")
+
+    # 3. Quality gate (acquisition module)
+    t = time.perf_counter()
+    accepted = quality_gate(faces, magface, cfg["quality_threshold"], device)
+    timings["quality"] = time.perf_counter() - t
+    if show:
+        _show_faces(accepted, "Accepted samples (best quality first)")
+
+    # 4. Features: all accepted samples for enrollment, only the best one for matching
+    t = time.perf_counter()
+    embeddings = extract_embeddings(accepted, embedding_model, device, cfg["batch_size"])
+    timings["embedding"] = time.perf_counter() - t
+
+    # 5. Operating mode
+    t = time.perf_counter()
+    print(f"\n{'=' * 30} {mode.upper()} {'=' * 30}")
+    if mode == "Enrollment":
+        if not user_name:
+            raise ValueError("Enrollment requires a user name.")
+        result = enroll_new_user(embeddings, user_name, cfg["gallery_name"], cfg["database_dir"])
+    elif mode == "Verification":
+        if claimed_id is None:
+            raise ValueError("Verification requires a claimed ID.")
+        result = verify_user(embeddings[0], cfg["Tv"], claimed_id, cfg["gallery_name"], cfg["database_dir"])
+    elif mode == "Identification":
+        result = identify_user(embeddings[0], cfg["gallery_name"], cfg["database_dir"], cfg["Ti"])
+    else:
+        raise ValueError(f"Invalid mode '{mode}': choose among 'Enrollment', 'Identification', 'Verification'.")
+    timings["matching"] = time.perf_counter() - t
+    timings["total"] = time.perf_counter() - t0
+
+    print("\nProcessing times: " + " | ".join(f"{k}: {v:.2f}s" for k, v in timings.items()))
+    return {"mode": mode, "result": result, "n_samples_used": len(accepted.images), "timings": timings}
+
+
+def load_models(cfg, device, use_liveness=True):
+    """Loads the MagFace quality model and (optionally) the liveness model from `cfg['model_dir']`."""
+    magface = face_quality.MagFaceEvaluator(os.path.join(cfg["model_dir"], cfg["magface_model_name"]), device=device)
+    liveness_model = None
+    if use_liveness:
+        liveness_model = liveness_detector.load_liveness_model(
+            os.path.join(cfg["model_dir"], cfg["liveness_model_name"]), device)
+    return magface, liveness_model
+
+
+def main():
+    import torch
+
+    parser = argparse.ArgumentParser(description="Classroom attendance system - live demo")
+    parser.add_argument("mode", choices=["enroll", "identify", "verify"])
+    parser.add_argument("--data-dir", required=True, help="Folder with the acquired sample(s) (max 3 used)")
+    parser.add_argument("--name", help="User name (enroll)")
+    parser.add_argument("--claimed-id", type=int, help="Claimed identity ID (verify)")
+    parser.add_argument("--no-liveness", action="store_true", help="Bypass the liveness detector")
+    args = parser.parse_args()
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    use_liveness = not args.no_liveness
+    magface, liveness_model = load_models(DEFAULT_CONFIG, device, use_liveness)
+    mode = {"enroll": "Enrollment", "identify": "Identification", "verify": "Verification"}[args.mode]
+    try:
+        run_session(mode, args.data_dir, DEFAULT_CONFIG["embedding_model"], device, magface, liveness_model,
+                    use_liveness=use_liveness, user_name=args.name, claimed_id=args.claimed_id)
+    except AcquisitionError as e:
+        print(f"\n>> RE-ACQUISITION REQUIRED: {e}")
+    except ValueError as e:
+        print(f"\n>> ERROR: {e}")
+
+
+if __name__ == "__main__":
+    main()

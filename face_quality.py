@@ -1,498 +1,377 @@
-import os
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
+"""
+Face Image Quality Assessment (FIQA) with MagFace.
+
+MagFace learns embeddings whose L2 magnitude is proportional to the sample's
+recognisability, so the norm of the (unnormalised) MagFace feature is used as a
+quality score. The quality threshold is calibrated with an Error-vs-Reject
+Characteristic (ERC) analysis, using the system's own recognition model
+(InceptionResnetV1-VGGFace2) to measure the error.
+"""
+import warnings
+
 import cv2
-from torchvision import transforms
-from iresnet import iresnet50
-import torch
-from sklearn.utils import Bunch
-from skimage import transform as trans
-from facenet_pytorch import MTCNN 
 import matplotlib.pyplot as plt
-import utilities as utils
+import numpy as np
+import torch
+from facenet_pytorch import MTCNN
+from skimage import transform as trans
+from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import normalize
+from sklearn.utils import Bunch
+from torchvision import transforms
+
+from iresnet import iresnet50
+
+# ArcFace/InsightFace reference positions of the 5 landmarks in a 112x112 crop
+REFERENCE_LANDMARKS_112 = np.array([
+    [38.2946, 51.6963],  # Left eye
+    [73.5318, 51.6963],  # Right eye
+    [56.0252, 71.7366],  # Nose
+    [41.5493, 92.3655],  # Left mouth corner
+    [70.7299, 92.3655],  # Right mouth corner
+], dtype=np.float32)
+
+
+def _load_checkpoint(model_path, device):
+    """Loads a checkpoint with weights-only unpickling, falling back to full unpickling (trusted files only)."""
+    try:
+        return torch.load(model_path, map_location=device, weights_only=True)
+    except Exception:
+        warnings.warn(f"'{model_path}' is not a weights-only checkpoint: loading it with full unpickling. "
+                      "Only do this with the official MagFace weights.")
+        return torch.load(model_path, map_location=device, weights_only=False)
 
 
 class MagFaceEvaluator:
+    """Wraps a MagFace iResNet50 backbone and exposes a `quality()` score."""
+
     def __init__(self, model_path, architecture='iresnet50', device='cuda'):
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
-        
-        # 1. Initialize Architecture
-        if architecture == 'iresnet50':
-            self.model = iresnet50(pretrained=False, num_classes=512)
-        else:
-            print("Using iresnet50 architecture for MagFace.")
-        
+        if architecture != 'iresnet50':
+            raise ValueError(f"Unsupported architecture '{architecture}': only 'iresnet50' is available.")
+        self.model = iresnet50(pretrained=False, num_classes=512)
+
         print(f"Loading MagFace weights from {model_path}...")
-        checkpoint = torch.load(model_path, map_location=self.device)
-        
-        # 2. Extract State Dict (Unwrap the file structure)
-        if 'state_dict' in checkpoint:
-            state_dict = checkpoint['state_dict']
-        elif 'model' in checkpoint:
-            state_dict = checkpoint['model']
-        else:
-            state_dict = checkpoint
-        # 3. AUTO-DETECT PREFIX
-        prefix = None
-        target_layer = "conv1.weight"
-        for k in state_dict.keys():
-            if k.endswith(target_layer):
-                # Calculate the prefix. 
-                # e.g., if k is "module.conv1.weight", prefix is "module."
-                prefix = k[: -len(target_layer)]
-                # print(f"DEBUG: Detected prefix '{prefix}'")
-                break
-        
+        checkpoint = _load_checkpoint(model_path, self.device)
+        state_dict = checkpoint.get('state_dict', checkpoint.get('model', checkpoint))
+
+        # The official checkpoint wraps the backbone (e.g. 'module.features.conv1.weight'):
+        # detect the prefix from a known layer and strip it.
+        prefix = next((k[:-len("conv1.weight")] for k in state_dict if k.endswith("conv1.weight")), None)
         if prefix is None:
-            # Fallback: Print first 5 keys to help debug if detection fails
-            print("DEBUG: Could not find 'conv1.weight' in file.")
-            print("First 5 keys in file:", list(state_dict.keys())[:5])
-            raise RuntimeError("Could not determine model prefix automatically.")
+            raise RuntimeError(f"Could not find 'conv1.weight' in the checkpoint. First keys: {list(state_dict)[:5]}")
+        state_dict = {(k[len(prefix):] if k.startswith(prefix) else k): v for k, v in state_dict.items()}
 
-        # 4. Clean Keys using the detected prefix
-        new_state_dict = {}
-        for k, v in state_dict.items():
-            if k.startswith(prefix):
-                # Remove the prefix
-                new_key = k[len(prefix):]
-                new_state_dict[new_key] = v
-            else:
-                # Keep as is (unlikely to match, but safe)
-                new_state_dict[k] = v
-            
-        # 5. Load Weights (Strict=False to ignore the final FC layer mismatch)
-        missing, unexpected = self.model.load_state_dict(new_state_dict, strict=False)
-        
-        # 6. Verify Critical Layers
+        # strict=False: the classification head of the training checkpoint is not needed
+        missing, _ = self.model.load_state_dict(state_dict, strict=False)
         if 'conv1.weight' in missing:
-            # This should barely happen now with the smart loader
-            raise RuntimeError(f"CRITICAL: 'conv1.weight' is still missing. Keys cleaned to: {list(new_state_dict.keys())[:3]}...")
-            
-        # print("Success: Backbone weights loaded correctly!")
-        
-        self.model.to(self.device)
-        self.model.eval()
+            raise RuntimeError("MagFace backbone weights were not loaded correctly.")
+        self.model.to(self.device).eval()
 
-        # 7. Preprocessing
         self.transform = transforms.Compose([
             transforms.ToPILImage(),
             transforms.Resize((112, 112)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
         ])
 
+    @torch.no_grad()
+    def quality(self, aligned_face_rgb):
+        """Quality score (MagFace feature magnitude) of an aligned 112x112 RGB uint8 face."""
+        input_tensor = self.transform(aligned_face_rgb).unsqueeze(0).to(self.device)
+        return torch.norm(self.model(input_tensor), p=2, dim=1).item()
 
 
-
-
-def compute_image_quality(self, face_image):
+def align_face_magface_mtcnn(img_rgb, detector):
     """
-    Args:
-        face_image: RGB image (numpy array) cropped to the face.
+    Aligns the main face of an RGB image to the 112x112 MagFace template using
+    the 5 MTCNN landmarks and a similarity transform.
+
     Returns:
-        float: Quality score (Magnitude of the embedding).
+        tuple: (aligned 112x112 image or None, success flag)
     """
-    # Preprocess
-    input_tensor = self.transform(face_image).unsqueeze(0).to(self.device)
-    
-    with torch.no_grad():
-        embedding = self.model(input_tensor)
-        quality_score = torch.norm(embedding, p=2, dim=1).item()
-        
-    return quality_score
-    
-    
-
-
-
-REFERENCE_LANDMARKS_112 = np.array([
-    [38.2946, 51.6963], # Left Eye
-    [73.5318, 51.6963], # Right Eye
-    [56.0252, 71.7366], # Nose
-    [41.5493, 92.3655], # Left Mouth
-    [70.7299, 92.3655]  # Right Mouth
-], dtype=np.float32)
-
-
-
-
-def align_face_magface_mtcnn(cv2_img, detector):
-    """
-    Aligns a face in the given image using MTCNN detector for MagFace quality assessment.
-    Args:
-        cv2_img: Input image in RGB format (numpy array).
-        detector: An instance of facenet_pytorch.MTCNN for face detection and landmark extraction.
-    Returns:
-        aligned_img: Aligned face image (112x112) or None if alignment failed.
-        is_aligned: Boolean indicating if alignment was successful.
-    """
-    # Run detection on the RAW image
-    boxes, probs, landmarks = detector.detect(cv2_img, landmarks=True)
-    
-    # If no face is found in a raw image, it fails to align.
+    _, _, landmarks = detector.detect(img_rgb, landmarks=True)
     if landmarks is None or len(landmarks) == 0:
-        return None, False  # Return None to signal failure
-    
-    facial5points = landmarks[0].astype(np.float32)
+        return None, False
     tform = trans.SimilarityTransform()
-    tform.estimate(facial5points, REFERENCE_LANDMARKS_112)
-    M = tform.params[0:2, :]
-    aligned_img = cv2.warpAffine(cv2_img, M, (112, 112), borderValue=0.0)
-    
+    tform.estimate(landmarks[0].astype(np.float32), REFERENCE_LANDMARKS_112)
+    aligned_img = cv2.warpAffine(img_rgb, tform.params[0:2, :], (112, 112), borderValue=0.0)
     return aligned_img, True
 
 
-
-def quality_check_magface(magface, dataset, processed_dataset, verbose=False, device='cpu', img_quality_threshold=20):
+def compute_quality_scores(magface, image_paths, device, aligner=None, verbose=False):
     """
-    Performs quality check on a dataset of FILE PATHS using MagFace, 
-    but returns the corresponding PRE-PROCESSED TENSOR from processed_dataset.
-    
+    MagFace quality of every image file. Images that cannot be read or aligned get NaN.
+    """
+    if aligner is None:
+        aligner = MTCNN(keep_all=False, device=device)
+    scores = np.full(len(image_paths), np.nan)
+    for i, path in enumerate(image_paths):
+        img_bgr = cv2.imread(str(path))
+        if img_bgr is None:
+            if verbose: print(f"[Quality] Load failed: {path}")
+            continue
+        aligned, ok = align_face_magface_mtcnn(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), aligner)
+        if not ok:
+            if verbose: print(f"[Quality] Alignment failed: {path}")
+            continue
+        scores[i] = magface.quality(aligned)
+    return scores
+
+
+def select_samples_by_quality(magface, processed_dataset, quality_threshold, device, verbose=False):
+    """
+    Acquisition-module quality gate.
+
+    Every acquired sample is scored with MagFace; samples whose score does not
+    exceed `quality_threshold` (or that cannot be aligned) are DISCARDED. The
+    accepted samples are returned sorted by decreasing quality, so the caller can
+    use the best one (matching) or all of them (enrolment). If the returned Bunch
+    is empty the user must be asked to re-acquire the sample(s).
+
     Args:
         magface: MagFaceEvaluator instance.
-        dataset: Bunch with .images (LIST OF FILE PATHS) and .target.
-        processed_dataset: Bunch with .images (TENSORS/ARRAYS) already cropped/detected must correspond 1-to-1 with 'dataset'.
-        verbose: Whether to print progress.
-        device: Device to run computations on.
-        img_quality_threshold: Minimum score to pass.
-        
+        processed_dataset: Bunch of detected faces with aligned `.paths` (from detect_faces /
+            filter_non_live_faces).
+        quality_threshold: Minimum MagFace score.
+        device: Torch device for the aligner.
+        verbose: Print the score/decision of every sample.
+
     Returns:
-        Bunch: A Bunch containing the single best image TENSOR from processed_dataset.
+        Bunch with `.images`, `.target`, `.paths`, `.quality_scores` of the accepted samples
+        (best first) and `.all_quality_scores` of every input sample.
     """
-    
-    # Initialize Aligner (Same as in threshold computation)
-    mtcnn_aligner = MTCNN(keep_all=False, device=device)
-    
-    best_tensor = None
-    best_target = None
-    best_quality = -1.0
-    best_idx = -1
-    passed_any = False
-    n_images = len(dataset.images)
-    # Sanity Check
-    if len(processed_dataset.images) != n_images:
-        raise ValueError(f"Mismatch: Paths ({n_images}) vs Processed Faces ({len(processed_dataset.images)})")
+    scores = compute_quality_scores(magface, processed_dataset.paths, device, verbose=verbose)
+    accepted = np.where(np.nan_to_num(scores, nan=-np.inf) > quality_threshold)[0]
+    accepted = accepted[np.argsort(-scores[accepted])]
 
-    if verbose: print(f"\n--- MagFace Quality Check (Paths Input) on {n_images} images ---")
+    if verbose:
+        print(f"\nQuality check (threshold={quality_threshold:.3f}):")
+        for path, s in zip(processed_dataset.paths, scores):
+            status = "N/A (no aligned face)" if np.isnan(s) else ("PASS" if s > quality_threshold else "FAIL")
+            print(f"  {path}: quality={s:.3f} -> {status}")
 
-    for i in range(n_images):
-        img_path = dataset.images[i]
-        target = dataset.target[i]
-        # Load & Align
-        try:
-            img_bgr = cv2.imread(img_path)
-            if img_bgr is None:
-                if verbose: print(f"DROPPED [Load Failed]: {img_path}")
-                
-            else:
-                img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-                aligned_img, is_aligned = align_face_magface_mtcnn(img_rgb, mtcnn_aligner)
-                if aligned_img is None: 
-                    if verbose: print(f"Warning: Could not align {img_path}. Skipping.")
-                # 3. COMPUTE QUALITY
-                # MagFace requires the aligned 112x112 image
-                score = compute_image_quality(magface, aligned_img)
-                
-                status = "PASS" if score > img_quality_threshold else "FAIL"
-                align_status = "Aligned" if is_aligned else "Raw-Resize"
-                
-                if verbose: print(f"Img {i}: [{align_status}] Score={score:.4f} -> {status}")
-                # 4. SELECTION LOGIC
-                if score > best_quality:
-                    best_quality = score
-                    # Select the corresponding TENSOR from the processed_dataset
-                    # This grabs the item at index 'i' which corresponds to the file path at index 'i'
-                    best_tensor = processed_dataset.images[i] 
-                    best_target = target
-                    best_idx = i
-        except Exception as e:
-            if verbose: print(f"Error processing {img_path}: {e}")
-            continue
-    # Final Reporting
-    if best_quality < img_quality_threshold:
-        print(f"Warning: Best image found (Score={best_quality:.2f}) is below threshold.")
-    if best_tensor is not None:
-        print(f"Selection: BEST Image Index {best_idx} (Score={best_quality:.2f})")
-    # Return Bunch with the pre-processed tensor (ready for embedding)
-    return Bunch(
-        images=np.array([best_tensor], dtype=object) if best_tensor is not None else np.array([]),
-        target=np.array([best_target]) if best_target is not None else np.array([]),
-        target_names=dataset.target_names
-    )    
-    
-
-
+    images = np.empty(len(accepted), dtype=object)
+    for k, idx in enumerate(accepted):
+        images[k] = processed_dataset.images[idx]
+    return Bunch(images=images,
+                 target=np.asarray(processed_dataset.target)[accepted],
+                 paths=np.asarray(processed_dataset.paths)[accepted],
+                 quality_scores=scores[accepted],
+                 all_quality_scores=scores,
+                 target_names=processed_dataset.target_names)
 
 
 def compute_fnmr_at_fmr(embeddings_probe, targets_probe, embeddings_gallery=None, targets_gallery=None, target_fmr=0.001):
     """
-    Calculates FNMR at a fixed FMR. Supports both:
-    1. Verification (1 Set): All-vs-All comparison (if gallery args are None).
-    2. Identification (2 Sets): Probe-vs-Gallery comparison.
+    False Non-Match Rate at a fixed False Match Rate (L2-normalised embeddings).
+
+      1. Probe vs Gallery (bipartite) when gallery embeddings/targets are given.
+      2. All-vs-all within the probe set otherwise (each unordered pair counted once).
     """
-    # Ensure embeddings are (N, 512)
+    embeddings_probe = np.asarray(embeddings_probe)
     if embeddings_probe.ndim == 3:
         embeddings_probe = embeddings_probe.squeeze(1)
-        
-    if embeddings_gallery is not None:
+    targets_probe = np.asarray(targets_probe)
+
+    if embeddings_gallery is not None and targets_gallery is not None:
+        embeddings_gallery = np.asarray(embeddings_gallery)
         if embeddings_gallery.ndim == 3:
             embeddings_gallery = embeddings_gallery.squeeze(1)
-
-    # --- SCENARIO A: PROBE vs GALLERY (Bipartite) ---
-    if embeddings_gallery is not None and targets_gallery is not None:
-        # 1. Similarity Matrix (Probe x Gallery)
         sim_matrix = np.dot(embeddings_probe, embeddings_gallery.T)
-        
-        # 2. Match Matrix
-        # Rows = Probes, Cols = Gallery
-        match_matrix = (targets_probe[:, None] == targets_gallery[None, :])
-        
-        # 3. Extract Scores (No diagonal/triu masking needed for bipartite)
-        genuine_scores = sim_matrix[match_matrix]
-        impostor_scores = sim_matrix[~match_matrix]
-        
-    # --- SHARED: THRESHOLD & ERROR CALCULATION ---
+        match_matrix = targets_probe[:, None] == np.asarray(targets_gallery)[None, :]
+        genuine_scores, impostor_scores = sim_matrix[match_matrix], sim_matrix[~match_matrix]
+    else:
+        sim_matrix = np.dot(embeddings_probe, embeddings_probe.T)
+        upper = np.triu(np.ones_like(sim_matrix, dtype=bool), k=1)     # exclude self/duplicate pairs
+        match_matrix = targets_probe[:, None] == targets_probe[None, :]
+        genuine_scores, impostor_scores = sim_matrix[upper & match_matrix], sim_matrix[upper & ~match_matrix]
+
     if len(genuine_scores) == 0 or len(impostor_scores) == 0:
-        return 1.0 # High error if no pairs exist
-        
-    # Sort impostor scores descending (high similarity = match)
+        return 1.0
+
+    # Threshold that lets through `target_fmr` of the impostor pairs
     impostor_scores = np.sort(impostor_scores)[::-1]
-    
-    # Index for the FMR cutoff
     fmr_index = int(target_fmr * len(impostor_scores))
     threshold = impostor_scores[fmr_index] if fmr_index < len(impostor_scores) else 1.0
-    
-    # Calculate FNMR
-    # FNMR = Ratio of Genuine pairs that fall BELOW the threshold
-    false_non_matches = np.sum(genuine_scores < threshold)
-    fnmr = false_non_matches / len(genuine_scores)
-    
-    return fnmr
-
-
-
+    return float(np.mean(genuine_scores < threshold))
 
 
 def merge_quality_and_embeddings(magface, mtcnn_aligner_magface, device, dataset, precomputed_embs, desc, verbose=True):
     """
-    Merges MagFace quality scores with pre-computed embeddings for a dataset of FILE PATHS.
+    Pairs the MagFace quality of every image file with its pre-computed recognition embedding.
+    Images that MagFace cannot align are dropped.
+
     Args:
-        magface: MagFaceEvaluator instance.
-        mtcnn_aligner_magface: MTCNN instance for alignment.
-        device: Device to run computations on.
-        dataset: Bunch with .images (LIST OF FILE PATHS) and .target.
-        precomputed_embs: (N, D) numpy array of pre-computed embeddings corresponding to dataset.images.
-        desc: Description string for logging.
-        verbose: Whether to print progress.
+        dataset: Bunch with `.images` (file paths, aligned with `precomputed_embs`) and `.target`.
+        precomputed_embs: (N, D) embeddings of the recognition model.
+
     Returns:
-        Tuple: (embeddings (N_valid, D), qualities (N_valid,), targets (N_valid,))
+        tuple: (embeddings (N_valid, D), qualities (N_valid,), targets (N_valid,))
     """
-    valid_qualities = []
-    valid_embeddings = [] # pick these from the pre-computed list
-    valid_targets = []
-    
-    n_images = len(dataset.images)
-    
-    # Ensure data consistency
-    if n_images != len(precomputed_embs):
-        raise ValueError(f"Mismatch in {desc}: {n_images} images vs {len(precomputed_embs)} embeddings.")
-    
-    for i in range(n_images):
-        img_path = dataset.images[i]
-        target = dataset.target[i]
-        existing_embedding = precomputed_embs[i]
-        
-        try:
-            # 1. Load Image (For MagFace Quality Calculation)
-            img_bgr = cv2.imread(img_path)
-            if img_bgr is None: 
-                if verbose: print(f"DROPPED [Load Failed]: {img_path}")
-                continue
-            # 2. MagFace Path (Compute Quality)
-            # Convert to RGB -> Align 112x112
-            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-            aligned_112, is_aligned = align_face_magface_mtcnn(img_rgb, mtcnn_aligner_magface)
-            if aligned_112 is None: 
-                # If MagFace can't find a face, drop this image, even if Inception found it.
-                if verbose: print(f"DROPPED [MagFace Align Failed]: {img_path}")
-                continue
+    if len(dataset.images) != len(precomputed_embs):
+        raise ValueError(f"Mismatch in {desc}: {len(dataset.images)} images vs {len(precomputed_embs)} embeddings.")
 
-            # Calculate Quality Score
-            input_blob = magface.transform(aligned_112).unsqueeze(0).to(device)
-            with torch.no_grad():
-                feat = magface.model(input_blob)
-                quality = torch.norm(feat, p=2, dim=1).item()
-            
-            # 3. Embedding Path (Retrieve Pre-computed)
-            #  take the embedding that corresponds to this index
-            valid_qualities.append(quality)
-            valid_embeddings.append(existing_embedding)
-            valid_targets.append(target)
-
-            if verbose and len(valid_qualities) % 30 == 0:
-                window = min(30, len(valid_qualities))
-                avg_quality = float(np.mean(valid_qualities[-window:]))
-                print(f"[{desc}] Processing {i+1}/{n_images} - Avg Quality (last {window} samples): {avg_quality:.2f}")
-        except Exception as e:
-            print(f"Error processing {img_path}: {e}")
-            continue
-
-    print(f"\n[{desc}] Completed. Valid pairs: {len(valid_qualities)}/{n_images}")
-    
-    return np.array(valid_embeddings), np.array(valid_qualities), np.array(valid_targets)
+    qualities = compute_quality_scores(magface, dataset.images, device, aligner=mtcnn_aligner_magface, verbose=verbose)
+    valid = ~np.isnan(qualities)
+    print(f"[{desc}] Valid (image, embedding) pairs: {valid.sum()}/{len(valid)}")
+    return np.asarray(precomputed_embs)[valid], qualities[valid], np.asarray(dataset.target)[valid]
 
 
-
-
-
-
-def compute_magface_threshold(magface, gallery_data, gallery_embeddings, probe_data, probe_embeddings, device, target_fmr=0.001, verbose=True):
+def erc_curve(probe_embs, probe_qualities, probe_targets, gal_embs, gal_targets, reject_ratios, target_fmr=0.001):
     """
-    Computes optimal quality threshold using a Hybrid Approach with PRE-COMPUTED Embeddings.
-    
-    Args:
-        magface: MagFaceEvaluator instance.
-        gallery_data: Bunch with .images (file paths) and .target.
-        gallery_embeddings: (N, D) numpy array of embeddings corresponding to gallery_data.images.
-        probe_data: Bunch with .images (file paths) and .target.
-        probe_embeddings: (M, D) numpy array of embeddings corresponding to probe_data.images.
-        device: Device to run computations on.
-        target_fmr: Target FMR for FNMR calculation.
-        verbose: Whether to print info and progresses.
+    Error-vs-Reject Characteristic: for each reject ratio R, the R% lowest-quality
+    probes are discarded and the FNMR@FMR of the surviving probes is computed.
+
     Returns:
-        float: Optimal quality threshold.
+        tuple: (fnmr per ratio, quality threshold per ratio)
     """
-    
-    # Initialize Aligner for MagFace (Strict 112x112)
-    mtcnn_aligner_magface = MTCNN(keep_all=False, device=device)
-    
-    print(f"\n--- Hybrid Threshold Evaluation (Pre-computed Embeddings) ---")
-    print(f"Gallery Images: {len(gallery_data.images)} | Embeddings: {gallery_embeddings.shape}")
-    print(f"Probe Images:   {len(probe_data.images)} | Embeddings: {probe_embeddings.shape}\n")
-
-    # --- PHASE 1: Collect Data (Merge Quality + Embeddings) ---
-    print(">>> Processing Gallery...")
-    gal_embs, gal_qualities, gal_targets =  merge_quality_and_embeddings(magface, mtcnn_aligner_magface, device, gallery_data, gallery_embeddings, "Gallery", verbose)
-    gal_embs = normalize(gal_embs, norm='l2')
-
-    # FILTER GALLERY: Optional but recommended
-    print(f"Filtered Gallery: {len(gal_embs)} images ")
-    print("\n>>> Processing Probe...")
-    probe_embs, probe_qualities, probe_targets = merge_quality_and_embeddings(magface, mtcnn_aligner_magface, device, probe_data, probe_embeddings, "Probe", verbose)
-    probe_embs = normalize(probe_embs, norm='l2')
-    n_probes = len(probe_qualities)
-
-    # --- PHASE 2: Simulate Rejection (ERC Curve) ---
-    reject_ratios = np.arange(0, 0.51, 0.01)
-    error_rates = []
-    thresholds_at_ratio = []
-    # Sort Probes by MagFace quality
-    sorted_indices = np.argsort(probe_qualities)
-    print("\n--- Simulating Rejection (Probe Filtering) ---")
-    print(f"{'Reject Ratio':<15} | {'Quality Thresh':<15} | {'FNMR (Error)':<15}")
-    print("-" * 50)
-
+    order = np.argsort(probe_qualities)
+    n = len(probe_qualities)
+    fnmr, thresholds = [], []
     for ratio in reject_ratios:
-        n_drop = int(n_probes * ratio)
-        keep_indices = sorted_indices[n_drop:]
-        if n_drop > 0:
-            curr_quality_thresh = probe_qualities[sorted_indices[n_drop-1]]
-        else:
-            curr_quality_thresh = np.min(probe_qualities)
-            
-        thresholds_at_ratio.append(curr_quality_thresh)
-        
-        subset_probe_embs = probe_embs[keep_indices]
-        subset_probe_targets = probe_targets[keep_indices]
-        
-        if len(subset_probe_embs) == 0:
-            fnmr = 1.0
-        else:
-            # Bipartite FNMR: Filtered Probes vs Clean Gallery
-            fnmr = compute_fnmr_at_fmr(embeddings_probe=subset_probe_embs,
-                targets_probe=subset_probe_targets,
-                embeddings_gallery=gal_embs,
-                targets_gallery=gal_targets,
-                target_fmr=target_fmr
-            )
-            
-        error_rates.append(fnmr)
-        print(f"{ratio*100:>5.1f}%          | {curr_quality_thresh:>10.4f}      | {fnmr:>10.4%}")
+        n_drop = int(n * ratio)
+        keep = order[n_drop:]
+        thresholds.append(probe_qualities[order[n_drop - 1]] if n_drop > 0 else np.min(probe_qualities))
+        fnmr.append(1.0 if len(keep) == 0 else compute_fnmr_at_fmr(
+            probe_embs[keep], probe_targets[keep], gal_embs, gal_targets, target_fmr))
+    return np.array(fnmr), np.array(thresholds)
 
-# --- PHASE 3: Permissive Selection with Local Refinement ---
-    error_rates_np = np.asarray(error_rates, dtype=float)
-    min_error_global = float(np.min(error_rates_np))
-    
-    # 1. FIND ANCHOR (The "Permissive" Starting Point)
-    # This finds the first point where error is decent (< 1% or close to global min)
-    # Same logic as before to find that 16% point.
-    target_performance = max(0.01, min_error_global * 1.20)
-    
-    anchor_idx = -1
-    hard_limit_idx = np.searchsorted(reject_ratios, 0.30) # Hard limit 30%
-    
-    for i in range(hard_limit_idx):
-        if error_rates_np[i] <= target_performance:
-            anchor_idx = i
-            break
-            
-    if anchor_idx == -1:
-        # Fallback: Just pick best error in range
-        anchor_idx = np.argmin(error_rates_np[:hard_limit_idx])
 
-    # 2. REFINE (Look for Higher Thresholds nearby)
-    # We look at the anchor and the next few points (e.g., +10% rejection range)
-    # We want to see if we can get a higher quality score with similar error.
-    
-    # Define "Similar Error": Allow error to vary slightly (e.g., +0.05%) from anchor
-    anchor_error = error_rates_np[anchor_idx]
-    local_tolerance = anchor_error + 0.05 
-    
-    # Search range: From Anchor up to Hard Limit (30%)
-    search_indices = range(anchor_idx, hard_limit_idx)
-    
-    candidate_indices = []
-    
-    for i in search_indices:
-        # If error is still good (similar to anchor), it's a candidate
-        if error_rates_np[i] <= local_tolerance:
-            candidate_indices.append(i)
-            
-    # 3. SELECT MAX THRESHOLD
-    # From the candidates, pick the one with the HIGHEST Quality Threshold
-    # (Since array is sorted by quality, higher index = higher threshold)
-    best_idx = np.max(candidate_indices) # This picks the right-most (highest quality) candidate
-    
-    optimal_threshold = thresholds_at_ratio[best_idx]
-    optimal_ratio = reject_ratios[best_idx]
-    selected_error = error_rates_np[best_idx]
+def select_reject_ratio(reject_ratios, error_rates, max_reject=0.30, refine_tolerance=0.05):
+    """
+    Anchor-and-refine selection of the operating reject ratio.
 
-    # --- Plotting ---
+      1. Anchor: the first ratio (below `max_reject`) whose error is within
+         max(1%, 1.2 x global minimum); if none, the ratio with the lowest error
+         below `max_reject`.
+      2. Refine: among the ratios between the anchor and `max_reject`, keep those
+         whose error is <= anchor_error + refine_tolerance and pick the largest
+         (i.e. the strictest quality gate).
+
+    NOTE: `refine_tolerance` is an ABSOLUTE difference of error rate:
+    0.05 means +5 percentage points of FNMR (not +0.05%). With such a loose
+    tolerance almost every ratio up to `max_reject` qualifies, so the selected
+    ratio tends to sit right below `max_reject`; use a smaller value (e.g. 0.0005)
+    to really keep the error "equal to the anchor".
+
+    Returns:
+        tuple: (selected index, anchor index, base target error)
+    """
+    error_rates = np.asarray(error_rates, dtype=float)
+    target_performance = max(0.01, float(np.min(error_rates)) * 1.20)
+    hard_limit_idx = int(np.searchsorted(reject_ratios, max_reject))
+
+    below = np.where(error_rates[:hard_limit_idx] <= target_performance)[0]
+    anchor_idx = int(below[0]) if len(below) else int(np.argmin(error_rates[:hard_limit_idx]))
+
+    local_tolerance = error_rates[anchor_idx] + refine_tolerance
+    candidates = [i for i in range(anchor_idx, hard_limit_idx) if error_rates[i] <= local_tolerance]
+    return int(max(candidates)), anchor_idx, target_performance
+
+
+def _plot_erc(reject_ratios, error_rates, sel_idx, anchor_idx, target_perf, threshold, title, error_std=None):
     plt.figure(figsize=(10, 6))
-    plt.plot(reject_ratios * 100, error_rates, marker='o', linestyle='-', linewidth=2, color='blue', label='FNMR Curve')
-    
-    # Visuals
-    plt.axhline(y=min_error_global, color='green', linestyle=':', label=f'Global Min ({min_error_global:.2%})')
-    plt.axhline(y=target_performance, color='orange', linestyle='--', label=f'Base Target ({target_performance:.2%})')
-    plt.axvline(x=optimal_ratio*100, color='red', linestyle='--', label=f"Refined Cutoff ({optimal_ratio*100:.0f}%)")
-    
-    # Show the Anchor (Starting Point) vs Selected (Refined)
-    plt.scatter([reject_ratios[anchor_idx]*100], [error_rates[anchor_idx]], color='gray', s=50, label='Anchor', zorder=5)
-    plt.scatter([optimal_ratio*100], [selected_error], color='red', s=150, label='Selected', zorder=6)
-    
-    plt.text(optimal_ratio*100 + 1, selected_error, f" Final Thresh: {optimal_threshold:.3f}", color='red', fontweight='bold', fontsize=12)
-    
-    plt.title(f"ERC Analysis\nSelected: {selected_error:.2%} @ {optimal_threshold:.3f} (Rejected {optimal_ratio:.0%})")
-    plt.xlabel("Reject Ratio (%)")
-    plt.ylabel("FNMR")
-    plt.grid(True, linestyle='--', alpha=0.6)
-    plt.legend(loc='best')
-    plt.tight_layout()
-    plt.show()
-    print(f"="*60)
-    print (f"\nOptimal Quality Threshold determined: {optimal_threshold:.4f}\nReject Ratio: {optimal_ratio*100:.2f}%\nFNMR: {selected_error:.4%})")
-    
-    return optimal_threshold
+    plt.plot(reject_ratios * 100, error_rates, marker='o', linewidth=2, color='blue', label='FNMR Curve')
+    if error_std is not None:
+        plt.fill_between(reject_ratios * 100, error_rates - error_std, error_rates + error_std,
+                         color='blue', alpha=0.15, label='±1 std (folds)')
+    plt.axhline(y=np.min(error_rates), color='green', linestyle=':', label=f'Global Min ({np.min(error_rates):.2%})')
+    plt.axhline(y=target_perf, color='orange', linestyle='--', label=f'Base Target ({target_perf:.2%})')
+    plt.axvline(x=reject_ratios[sel_idx] * 100, color='red', linestyle='--', label=f"Cutoff ({reject_ratios[sel_idx]*100:.0f}%)")
+    plt.scatter([reject_ratios[anchor_idx] * 100], [error_rates[anchor_idx]], color='gray', s=50, label='Anchor', zorder=5)
+    plt.scatter([reject_ratios[sel_idx] * 100], [error_rates[sel_idx]], color='red', s=150, label='Selected', zorder=6)
+    plt.text(reject_ratios[sel_idx] * 100 + 1, error_rates[sel_idx], f" Thresh: {threshold:.3f}", color='red', fontweight='bold')
+    plt.title(title)
+    plt.xlabel("Reject Ratio (%)"); plt.ylabel("FNMR")
+    plt.grid(True, linestyle='--', alpha=0.6); plt.legend(loc='best')
+    plt.tight_layout(); plt.show()
+
+
+def compute_magface_threshold(magface, gallery_data, gallery_embeddings, device, k_folds=4, target_fmr=0.001,
+                              max_reject=0.30, refine_tolerance=0.05, seed=42, verbose=True):
+    """
+    Calibrates the quality threshold on the GALLERY ONLY (the probe set stays an
+    untouched test set) with Stratified K-Fold ERC analysis:
+
+      - in every fold, the held-out gallery images act as probes and are matched
+        against the remaining gallery images (recognition embeddings);
+      - the ERC curves are averaged across folds and the reject ratio is chosen
+        with `select_reject_ratio`;
+      - the threshold is the MagFace quality at that ratio of the gallery quality distribution.
+
+    Args:
+        gallery_data: Bunch with `.images` (file paths aligned with `gallery_embeddings`) and `.target`.
+        gallery_embeddings: (N, D) embeddings of the recognition model.
+
+    Returns:
+        float: quality threshold (samples must score ABOVE it).
+    """
+    aligner = MTCNN(keep_all=False, device=device)
+    embs, qualities, targets = merge_quality_and_embeddings(magface, aligner, device, gallery_data,
+                                                            gallery_embeddings, "Gallery", verbose=False)
+    embs = normalize(embs, norm='l2')
+
+    reject_ratios = np.round(np.arange(0, 0.51, 0.01), 2)
+    skf = StratifiedKFold(n_splits=k_folds, shuffle=True, random_state=seed)
+    fold_curves = []
+    for gal_idx, val_idx in skf.split(embs, targets):
+        fnmr, _ = erc_curve(embs[val_idx], qualities[val_idx], targets[val_idx],
+                            embs[gal_idx], targets[gal_idx], reject_ratios, target_fmr)
+        fold_curves.append(fnmr)
+    fold_curves = np.array(fold_curves)
+    mean_curve, std_curve = fold_curves.mean(axis=0), fold_curves.std(axis=0)
+
+    sel_idx, anchor_idx, target_perf = select_reject_ratio(reject_ratios, mean_curve, max_reject, refine_tolerance)
+    sorted_q = np.sort(qualities)
+    n_drop = int(len(sorted_q) * reject_ratios[sel_idx])
+    threshold = float(sorted_q[n_drop - 1]) if n_drop > 0 else float(sorted_q[0])
+
+    if verbose:
+        print(f"{'Reject Ratio':<14} | {'Mean FNMR':<10} | {'Std':<8}")
+        for r, m, s in zip(reject_ratios, mean_curve, std_curve):
+            print(f"{r*100:>6.0f}%        | {m:>8.3%}  | {s:.4f}")
+    _plot_erc(reject_ratios, mean_curve, sel_idx, anchor_idx, target_perf, threshold,
+              f"ERC on gallery ({k_folds}-fold CV)\nSelected: {mean_curve[sel_idx]:.2%} @ quality {threshold:.3f} "
+              f"(rejects {reject_ratios[sel_idx]:.0%} of the gallery samples)", error_std=std_curve)
+    print(f"\nOptimal Quality Threshold: {threshold:.4f} | Reject ratio (CV): {reject_ratios[sel_idx]*100:.0f}% "
+          f"| Expected FNMR@FMR={target_fmr:.1%}: {mean_curve[sel_idx]:.4%}")
+    return threshold
+
+
+def evaluate_quality_threshold_on_probes(magface, gallery_data, gallery_embeddings, probe_data, probe_embeddings,
+                                         device, quality_threshold, target_fmr=0.001):
+    """
+    TEST-SET assessment of a quality threshold calibrated on the gallery: plots the
+    ERC of the probes and reports the rejection rate and FNMR@FMR obtained with
+    and without the quality gate.
+
+    Returns:
+        dict with 'reject_rate', 'fnmr_without_gate', 'fnmr_with_gate'.
+    """
+    aligner = MTCNN(keep_all=False, device=device)
+    gal_embs, _, gal_t = merge_quality_and_embeddings(magface, aligner, device, gallery_data, gallery_embeddings, "Gallery", verbose=False)
+    prb_embs, prb_q, prb_t = merge_quality_and_embeddings(magface, aligner, device, probe_data, probe_embeddings, "Probe", verbose=False)
+    gal_embs, prb_embs = normalize(gal_embs, norm='l2'), normalize(prb_embs, norm='l2')
+
+    keep = prb_q > quality_threshold
+    result = {
+        "reject_rate": float(1 - keep.mean()),
+        "fnmr_without_gate": compute_fnmr_at_fmr(prb_embs, prb_t, gal_embs, gal_t, target_fmr),
+        "fnmr_with_gate": compute_fnmr_at_fmr(prb_embs[keep], prb_t[keep], gal_embs, gal_t, target_fmr),
+    }
+
+    reject_ratios = np.round(np.arange(0, 0.51, 0.01), 2)
+    fnmr, _ = erc_curve(prb_embs, prb_q, prb_t, gal_embs, gal_t, reject_ratios, target_fmr)
+    plt.figure(figsize=(10, 6))
+    plt.plot(reject_ratios * 100, fnmr, marker='o', linewidth=2, color='blue', label='Probe ERC')
+    plt.axvline(result["reject_rate"] * 100, color='red', linestyle='--',
+                label=f"Quality gate {quality_threshold:.3f} -> rejects {result['reject_rate']:.1%}")
+    plt.title("ERC on probes (test set)")
+    plt.xlabel("Reject Ratio (%)"); plt.ylabel("FNMR")
+    plt.grid(True, linestyle='--', alpha=0.6); plt.legend(); plt.tight_layout(); plt.show()
+
+    print(f"Probe reject rate: {result['reject_rate']:.2%}")
+    print(f"FNMR@FMR={target_fmr:.1%} without gate: {result['fnmr_without_gate']:.4%} | "
+          f"with gate: {result['fnmr_with_gate']:.4%}")
+    return result

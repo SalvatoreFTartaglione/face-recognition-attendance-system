@@ -1,6 +1,12 @@
-import torch
+"""
+iResNet backbone used by MagFace.
+
+Third-party code: adapted from the official MagFace repository
+(https://github.com/IrvingMeng/MagFace, models/iresnet.py),
+released under the Apache License 2.0. Only used to load the pretrained
+MagFace weights for face image quality assessment.
+"""
 from torch import nn
-# from torchvision.models.utils import load_state_dict_from_url
 
 __all__ = ['iresnet18', 'iresnet34', 'iresnet50', 'iresnet100']
 
@@ -134,12 +140,8 @@ class IResNet(nn.Module):
 
 
 def _iresnet(arch, block, layers, pretrained, progress, **kwargs):
-    model = IResNet(block, layers, **kwargs)
-    # if pretrained:
-    # state_dict = load_state_dict_from_url(model_urls[arch],
-    #                                        progress=progress)
-    # model.load_state_dict(state_dict)
-    return model
+    # Pretrained weights are loaded explicitly by face_quality.MagFaceEvaluator
+    return IResNet(block, layers, **kwargs)
 
 
 def iresnet18(pretrained=False, progress=True, **kwargs):

@@ -1,170 +1,119 @@
+"""
+Liveness (replay-attack) detection module.
+
+A MobileNetV2 backbone (ImageNet initialisation, fully fine-tuned) with a single
+logit output classifies face crops as Live (1) or Fake (0). The module also
+contains the dataset loading/splitting utilities and evaluation helpers.
+"""
 import os
-import shutil
-from tabnanny import verbose
-import cv2
-import pandas as pd
-import random
-import zipfile
+
+import matplotlib.pyplot as plt
 import numpy as np
-from skimage.transform import resize
-from traitlets import Bunch
-from sklearn.model_selection import train_test_split
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms 
 import torch
 import torch.nn as nn
-from torchvision import models
+from sklearn.metrics import accuracy_score, auc, roc_curve
 from sklearn.model_selection import GroupShuffleSplit
-from sklearn.metrics import accuracy_score
-import matplotlib.pyplot as plt
-from sklearn.metrics import roc_curve, auc, accuracy_score
+from sklearn.utils import Bunch
+from torch.utils.data import Dataset
+from torchvision import models
+
+IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.bmp')
 
 
-# Custom Dataset to hold the processed results output compatible with DataLoader
 class LivenessDatasetWrapper(Dataset):
+    """Exposes a Bunch of CHW face crops (+ labels) as a PyTorch Dataset."""
+
     def __init__(self, processed_data):
         self.source = processed_data
-        self.is_dataset = False
 
     def __len__(self):
-        if self.is_dataset:
-            return len(self.source)
         return len(self.source.images)
 
     def __getitem__(self, idx):
-        if self.is_dataset:
-            return self.source[idx]
-        img = self.source.images[idx]
-        lbl = self.source.target[idx]
-        
-        # Ensure Tensor format (C, H, W)
-        if isinstance(img, np.ndarray):
-            img = torch.from_numpy(img)
-        
-        if not isinstance(lbl, torch.Tensor):
-            lbl = torch.tensor(lbl, dtype=torch.long)
-            
+        img = torch.as_tensor(np.asarray(self.source.images[idx], dtype=np.float32))
+        lbl = torch.tensor(self.source.target[idx], dtype=torch.long)
         return img, lbl
-    
-    
-    
+
+
 class LivenessMobileNet(nn.Module):
+    """MobileNetV2 with its 1000-class head replaced by a single liveness logit."""
+
     def __init__(self, pretrained=True):
-        super(LivenessMobileNet, self).__init__()
-        # Load Pretrained MobileNetV2
+        super().__init__()
         weights = models.MobileNet_V2_Weights.IMAGENET1K_V1 if pretrained else None
         self.backbone = models.mobilenet_v2(weights=weights)
-        
-        # Replace the classifier head
-        # Original input features of classifier[1] is 1280
-        # output 1 value (Logit) for Binary Classification
         self.backbone.classifier[1] = nn.Linear(in_features=1280, out_features=1)
-        
+
     def forward(self, x):
         return self.backbone(x)
-    
-    
-    
 
 
+def load_liveness_model(model_path, device):
+    """Builds the network and loads a trained state_dict (safe, weights-only loading)."""
+    model = LivenessMobileNet(pretrained=False)
+    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+    return model.to(device).eval()
 
-def download_liveness_dataset(data_dir, train_split=0.7, val_split=0.15, test_split=0.15):
+
+def download_liveness_dataset(data_dir, train_split=0.6, val_split=0.2, test_split=0.2, seed=42):
     """
-    Loads the Liveness Dataset (Real vs Fake) keeping original resolution.
-    Merges 'galleries' and 'probes' folders and splits them globally.
-    store only the file paths (strings) in dataset lists 
-    Ensures reproducibility with fixed random seed.
-    Structure Expected:
-    data_dir/
-       galleries/
-          fake/subject_XX/...
-          real/subject_XX/...
-       probes/
-          fake/subject_XX/...
-          real/subject_XX/...
-    Args:
-        data_dir (str): Path to root folder.
-        train_split (float): Ratio for training.
-        val_split (float): Ratio for validation.
-        test_split (float): Ratio for testing.
+    Loads the liveness dataset (Real vs Fake) as file paths and performs a
+    SUBJECT-DISJOINT train/val/test split (GroupShuffleSplit on the subject id),
+    so a subject's genuine images and their replayed copies never end up in
+    different splits.
+
+    Expected structure:
+        data_dir/{galleries,probes}/{fake,real}/subject_XX/*.jpg
+
+    Note: the ratios are applied to *subjects* (groups), so image proportions
+    are only approximately equal to the requested ones.
 
     Returns:
         tuple: (train_data, val_data, test_data, target_names)
-               Each *_data is a Bunch with .images (numpy array of objects) and .target
     """
-
     classes = {'fake': 0, 'real': 1}
     target_names = np.array(['Fake', 'Real'])
-    all_paths = [] # Store strings, not arrays
-    all_labels = []
-    all_subjects = []               # Store the subject ID (e.g., "subject_01")
-    sources = ['galleries', 'probes']
-    
-    for source in sources:
+    all_paths, all_labels, all_subjects = [], [], []
+
+    for source in ['galleries', 'probes']:
         source_path = os.path.join(data_dir, source)
-        if not os.path.exists(source_path): continue
-        
+        if not os.path.exists(source_path):
+            continue
         for class_name, label_id in classes.items():
             class_path = os.path.join(source_path, class_name)
-            if not os.path.exists(class_path): 
+            if not os.path.exists(class_path):
                 print(f"Warning: Class path '{class_path}' does not exist. Skipping.")
                 continue
-            
-            for subject_folder in os.listdir(class_path):
+            for subject_folder in sorted(os.listdir(class_path)):
                 subject_path = os.path.join(class_path, subject_folder)
-                if os.path.isdir(subject_path):
-                    for file in os.listdir(subject_path):
-                        if file.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp')):
-                            img_path = os.path.join(subject_path, file)
-                            # Store only the paths
-                            all_paths.append(img_path)
-                            all_labels.append(label_id)
-                            all_subjects.append(subject_folder)            
-                            
-    all_paths = np.array(all_paths)
-    all_labels = np.array(all_labels)
-    all_subjects = np.array(all_subjects)
+                if not os.path.isdir(subject_path):
+                    continue
+                for file in sorted(os.listdir(subject_path)):
+                    if file.lower().endswith(IMAGE_EXTENSIONS):
+                        all_paths.append(os.path.join(subject_path, file))
+                        all_labels.append(label_id)
+                        all_subjects.append(subject_folder)
+
+    all_paths, all_labels, all_subjects = map(np.array, (all_paths, all_labels, all_subjects))
     print(f"Found {len(all_paths)} images across {len(np.unique(all_subjects))} subjects.")
-    
-    # Perform Subject-Disjoint Split using GroupShuffleSplit
-    # This splits the GROUPS (Subjects), not just the images.
-    # First Split: Train vs (Val + Test)
-    gss1 = GroupShuffleSplit(n_splits=1, train_size=train_split, random_state=42)
+
+    # 1st split: train vs (val + test)
+    gss1 = GroupShuffleSplit(n_splits=1, train_size=train_split, random_state=seed)
     train_idx, temp_idx = next(gss1.split(all_paths, all_labels, groups=all_subjects))
-    
-    # Second Split: Val vs Test
-    # Adjust ratio for the remaining data
+    # 2nd split: val vs test
     relative_test_size = test_split / (val_split + test_split)
-    # Get the data for the second split
-    temp_paths = all_paths[temp_idx]
-    temp_labels = all_labels[temp_idx]
-    temp_subjects = all_subjects[temp_idx]
-    
-    gss2 = GroupShuffleSplit(n_splits=1, test_size=relative_test_size, random_state=42)
-    val_sub_idx, test_sub_idx = next(gss2.split(temp_paths, temp_labels, groups=temp_subjects))
-    
-    # Map back to original indices
-    val_idx = temp_idx[val_sub_idx]
-    test_idx = temp_idx[test_sub_idx]
+    gss2 = GroupShuffleSplit(n_splits=1, test_size=relative_test_size, random_state=seed)
+    val_sub, test_sub = next(gss2.split(all_paths[temp_idx], all_labels[temp_idx], groups=all_subjects[temp_idx]))
+    val_idx, test_idx = temp_idx[val_sub], temp_idx[test_sub]
 
-    # 4. Create Bunches
-    def create_bunch(idxs, split_name):
-        paths = all_paths[idxs]
-        lbls = all_labels[idxs]
-        # Verify no subject leakage
-        unique_subs = np.unique(all_subjects[idxs])
-        return Bunch(images=paths, target=lbls, target_names=target_names, subjects=unique_subs)
+    def create_bunch(idxs):
+        return Bunch(images=all_paths[idxs], target=all_labels[idxs],
+                     target_names=target_names, subjects=np.unique(all_subjects[idxs]))
 
-    train_data = create_bunch(train_idx, "Training")
-    val_data   = create_bunch(val_idx,   "Validation")
-    test_data  = create_bunch(test_idx,  "Test")
-    
-    # Double Check Leakage
-    train_subs = set(train_data.subjects)
-    val_subs = set(val_data.subjects)
-    test_subs = set(test_data.subjects)
-    
-    if train_subs.intersection(val_subs) or train_subs.intersection(test_subs):
+    train_data, val_data, test_data = create_bunch(train_idx), create_bunch(val_idx), create_bunch(test_idx)
+
+    train_subs, val_subs, test_subs = set(train_data.subjects), set(val_data.subjects), set(test_data.subjects)
+    if train_subs & val_subs or train_subs & test_subs or val_subs & test_subs:
         print("CRITICAL WARNING: DATA LEAKAGE DETECTED (Subjects overlap)!")
     else:
         print("Success: No subject overlap between splits.")
@@ -172,278 +121,169 @@ def download_liveness_dataset(data_dir, train_split=0.7, val_split=0.15, test_sp
     return train_data, val_data, test_data, target_names
 
 
-
-
+@torch.no_grad()
+def predict_liveness(loader, model, device):
+    """Returns the liveness probabilities (sigmoid of the logit) for every sample of a loader."""
+    model.eval().to(device)
+    probs = []
+    for batch in loader:
+        images = batch[0] if isinstance(batch, (list, tuple)) else batch
+        probs.extend(torch.sigmoid(model(images.to(device))).cpu().view(-1).numpy())
+    return np.array(probs)
 
 
 def evaluate_liveness(loader, model, device, threshold=0.5, live_demo=False):
     """
-    Evaluates the liveness model on the provided DataLoader and computes metrics.
+    Evaluates the liveness model on a labelled DataLoader.
+
     Args:
-        loader (DataLoader): DataLoader for the liveness dataset.
+        loader: DataLoader yielding (images, labels), 1 = live, 0 = fake.
         model: Trained liveness model.
         device: 'cuda' or 'cpu'.
-        threshold (float): Score above which a face is considered live.
-        live_demo (bool): If True, skips visualization (for live demos).
-    Returns:
-        tuple: (all_probs, all_labels, flr, ffr)
-    """
-    model.eval()
-    model.to(device)
-    all_probs = []
-    all_labels = []
+        threshold: Score >= threshold -> Live.
+        live_demo: If True, skips the plots.
 
-    # 1. Inference Loop
+    Returns:
+        tuple: (all_probs, all_labels, flr, ffr) where FLR = False Live Rate
+        (fakes accepted) and FFR = False Fake Rate (lives rejected).
+    """
+    # Single pass over the loader so scores and labels stay aligned even if it shuffles
+    model.eval().to(device)
+    all_probs, all_labels = [], []
     with torch.no_grad():
         for images, labels in loader:
-            images = images.to(device)
-            logits = model(images)
-            probs = torch.sigmoid(logits).cpu().view(-1).numpy()
-            all_probs.extend(probs)
+            all_probs.extend(torch.sigmoid(model(images.to(device))).cpu().view(-1).numpy())
             all_labels.extend(labels.numpy())
-
-    all_probs = np.array(all_probs)
-    all_labels = np.array(all_labels)
+    all_probs, all_labels = np.array(all_probs), np.array(all_labels)
     predictions = (all_probs >= threshold).astype(int)
 
-    # 2. Compute Metrics
     acc = accuracy_score(all_labels, predictions)
-    fake_indices = (all_labels == 0)
-    real_indices = (all_labels == 1)
-    
-    flr = np.mean(predictions[fake_indices] == 1) if np.sum(fake_indices) > 0 else 0.0
-    ffr = np.mean(predictions[real_indices] == 0) if np.sum(real_indices) > 0 else 0.0
+    fake_mask, real_mask = all_labels == 0, all_labels == 1
+    flr = np.mean(predictions[fake_mask] == 1) if fake_mask.any() else 0.0
+    ffr = np.mean(predictions[real_mask] == 0) if real_mask.any() else 0.0
     acer = (flr + ffr) / 2
 
     if not live_demo:
-        # 3. Visualization Logic
         fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-        
-        # --- Plot A: Score Distribution ---
-        ax_hist = axes[0]
-        if np.any(real_indices):
-            ax_hist.hist(all_probs[real_indices], bins=30, alpha=0.5, color='green', label='Live', density=True)
-        if np.any(fake_indices):
-            ax_hist.hist(all_probs[fake_indices], bins=30, alpha=0.5, color='red', label='Fake', density=True)
-            
-        ax_hist.axvline(threshold, color='blue', linestyle='--', linewidth=2, label=f'Tf={threshold:.3f}')
-        ax_hist.set_title("Score Distribution", fontweight='bold')
-        ax_hist.set_xlabel("Liveness Probability")
-        ax_hist.legend()
-        ax_hist.grid(alpha=0.3)
 
-        # --- Plot B: ROC Curve ---
+        # A. Score distribution
+        ax = axes[0]
+        if real_mask.any():
+            ax.hist(all_probs[real_mask], bins=30, alpha=0.5, color='green', label='Live', density=True)
+        if fake_mask.any():
+            ax.hist(all_probs[fake_mask], bins=30, alpha=0.5, color='red', label='Fake', density=True)
+        ax.axvline(threshold, color='blue', linestyle='--', linewidth=2, label=f'Tf={threshold:.3f}')
+        ax.set_title("Score Distribution", fontweight='bold')
+        ax.set_xlabel("Liveness Probability")
+        ax.legend(); ax.grid(alpha=0.3)
+
+        # B. ROC curve
         if len(np.unique(all_labels)) > 1:
             fpr, tpr, roc_thresholds = roc_curve(all_labels, all_probs)
-            roc_auc = auc(fpr, tpr)
-            ax_roc = axes[1]
-            ax_roc.plot(fpr, tpr, color='darkorange', lw=2, label=f'AUC = {roc_auc:.3f}')
-            ax_roc.plot([0, 1], [0, 1], color='navy', lw=1, linestyle='--')
-            
-            # Mark current threshold on ROC (Nearest neighbor search)
-            if len(roc_thresholds) > 0:
-                idx = np.argmin(np.abs(roc_thresholds - threshold))
-                ax_roc.scatter(fpr[idx], tpr[idx], color='black', zorder=5, label='Current Tf')
-                
-            ax_roc.set_title("ROC Curve", fontweight='bold')
-            ax_roc.set_xlabel('FAR (False Accept Rate)')
-            ax_roc.set_ylabel('TPR (True Accept Rate)')
-            ax_roc.legend()
-            ax_roc.grid(alpha=0.3)
+            ax = axes[1]
+            ax.plot(fpr, tpr, color='darkorange', lw=2, label=f'AUC = {auc(fpr, tpr):.3f}')
+            ax.plot([0, 1], [0, 1], color='navy', lw=1, linestyle='--')
+            idx = np.argmin(np.abs(roc_thresholds - threshold))
+            ax.scatter(fpr[idx], tpr[idx], color='black', zorder=5, label='Current Tf')
+            ax.set_title("ROC Curve", fontweight='bold')
+            ax.set_xlabel('FLR (False Live Rate)'); ax.set_ylabel('True Live Rate')
+            ax.legend(); ax.grid(alpha=0.3)
 
-        # --- Plot C: FAR & FRR vs Threshold (CORRECTED) ---
-        ax_err = axes[2]
-        
-        # Create a dense range of thresholds from 0 to 1
-        threshold_range = np.linspace(0, 1, 200)
-        far_list = [] # False Live Rate
-        frr_list = [] # False Fake Rate
-        
-        # Pre-calculate masks to speed up loop
-        fakes = all_probs[fake_indices]
-        lives = all_probs[real_indices]
-        
-        for t in threshold_range:
-            # FAR (False Live): % of Fakes with Score >= t
-            curr_far = np.mean(fakes >= t) if len(fakes) > 0 else 0.0
-            
-            # FRR (False Fake): % of Lives with Score < t
-            curr_frr = np.mean(lives < t) if len(lives) > 0 else 0.0
-            
-            far_list.append(curr_far)
-            frr_list.append(curr_frr)
-            
-        ax_err.plot(threshold_range, far_list, color='red', lw=2, label='FAR (False Live)')
-        ax_err.plot(threshold_range, frr_list, color='blue', lw=2, label='FRR (False Fake)')
-        ax_err.axvline(threshold, color='black', linestyle='--', label=f'Current Tf={threshold:.3f}')
-        
-        ax_err.set_title("FAR & FRR vs Threshold", fontweight='bold')
-        ax_err.set_xlabel('Threshold')
-        ax_err.set_ylabel('Error Rate')
-        ax_err.set_xlim(0, 1.0)
-        ax_err.set_ylim(0, 1.0)
-        ax_err.legend()
-        ax_err.grid(alpha=0.3)
+        # C. Error rates vs threshold
+        ts = np.linspace(0, 1, 200)
+        fakes, lives = all_probs[fake_mask], all_probs[real_mask]
+        flr_curve = [np.mean(fakes >= t) if len(fakes) else 0.0 for t in ts]
+        ffr_curve = [np.mean(lives < t) if len(lives) else 0.0 for t in ts]
+        ax = axes[2]
+        ax.plot(ts, flr_curve, color='red', lw=2, label='FLR (False Live)')
+        ax.plot(ts, ffr_curve, color='blue', lw=2, label='FFR (False Fake)')
+        ax.axvline(threshold, color='black', linestyle='--', label=f'Current Tf={threshold:.3f}')
+        ax.set_title("Error Rates vs Threshold", fontweight='bold')
+        ax.set_xlabel('Threshold'); ax.set_ylabel('Error Rate')
+        ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+        ax.legend(); ax.grid(alpha=0.3)
 
         plt.tight_layout()
         plt.show()
-        
-    # 4. Print Statistics
+
     print("-" * 40)
     print(f"LIVENESS STATS (Tf={threshold:.4f})")
     print("-" * 40)
     print(f"Accuracy:          {acc*100:.3f}%")
-    print(f"False Live Rate:   {flr*100:.3f}%") 
+    print(f"False Live Rate:   {flr*100:.3f}%")
     print(f"False Fake Rate:   {ffr*100:.3f}%")
     print(f"Average Error:     {acer*100:.3f}%")
     print("-" * 40)
-    
+
     return all_probs, all_labels, flr, ffr
-
-
-
 
 
 def download_liveness_test_paths(data_dir):
     """
-    Loads a specific Liveness Test Set from a directory.
-    Structure Expected:
-       data_dir/
-          fake/ (img1.jpg, img2.jpg ...) -> Label 0
-          real/ (img1.jpg, img2.jpg ...) -> Label 1
-    Args:
-        data_dir (str): Path to the folder containing 'real' and 'fake' subfolders.
-
-    Returns:
-        test_data (Bunch): Object with .images (paths) and .target (labels).
+    Loads an external liveness test set made of `data_dir/fake/*` (label 0) and
+    `data_dir/real/*` (label 1). Returns a Bunch of file paths and labels.
     """
     classes = {'fake': 0, 'real': 1}
     target_names = np.array(['Fake', 'Real'])
-    
-    all_paths = [] 
-    all_labels = []
-
-    # print(f"Scanning External Test Set at: {data_dir}")
+    all_paths, all_labels = [], []
 
     if not os.path.exists(data_dir):
         print(f"Error: Directory {data_dir} not found.")
         return Bunch(images=np.array([]), target=np.array([]), target_names=target_names)
 
-    # Iterate through 'real' and 'fake' folders
     for class_name, label_id in classes.items():
         class_path = os.path.join(data_dir, class_name)
-        
         if not os.path.exists(class_path):
             print(f"Warning: Folder '{class_name}' not found in {data_dir}")
             continue
-            
-        # Walk through files (supports subfolders if any, or flat structure)
-        for root, dirs, files in os.walk(class_path):
-            for file in files:
-                if file.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp')):
-                    img_path = os.path.join(root, file)
-                    
-                    all_paths.append(img_path)
+        for root, _, files in os.walk(class_path):
+            for file in sorted(files):
+                if file.lower().endswith(IMAGE_EXTENSIONS):
+                    all_paths.append(os.path.join(root, file))
                     all_labels.append(label_id)
 
-    # Convert to Numpy Arrays
-    all_paths = np.array(all_paths)
-    all_labels = np.array(all_labels)
-
-    print(f"Found {len(all_paths)} images.")
-    print(f" - Real: {np.sum(all_labels == 1)}")
-    print(f" - Fake: {np.sum(all_labels == 0)}")
-
-    # Return Bunch
+    all_paths, all_labels = np.array(all_paths), np.array(all_labels)
+    print(f"Found {len(all_paths)} images (Real: {np.sum(all_labels == 1)}, Fake: {np.sum(all_labels == 0)}).")
     return Bunch(images=all_paths, target=all_labels, target_names=target_names)
 
 
-
-
-def filter_non_live_faces(original_data, test_data_paths, loader, model, device, threshold=0.5, verbose=False):
+def filter_non_live_faces(processed_data, loader, model, device, threshold=0.5, verbose=False):
     """
-    Detects liveness for all faces in the loader, filters out the 'Fake' ones from BOTH 
-    the detected faces dataset and the original paths dataset.
-    
+    Scores every detected face and keeps only the ones classified as Live.
+
     Args:
-        original_data (Bunch): The object containing detected faces (.images as numpy array) and .target.
-        test_data_paths (Bunch): The object containing original file paths (.images as strings).
-        loader (DataLoader): Loader corresponding exactly to original_data (shuffle=False).
+        processed_data: Bunch returned by `face_detection.detect_faces(..., cnn=True)`
+            (CHW faces, aligned `.paths` and `.target`).
+        loader: DataLoader over `processed_data` with shuffle=False.
         model: Trained liveness model.
         device: 'cuda' or 'cpu'.
-        threshold: Score above which a face is considered live.
-        verbose: Whether to print detailed logs.
-        
+        threshold: Liveness threshold Tf (score >= Tf -> Live).
+        verbose: Print the score and decision of every sample.
+
     Returns:
-        tuple: (filtered_detected_bunch, filtered_paths_bunch) containing only live faces.
+        Bunch with the live faces in HWC format (ready for display/embedding),
+        their `.paths`, `.target` and `.liveness_scores`. It may be empty.
     """
-    if verbose: print(f"\nRunning Liveness Filtering (Threshold={threshold})...")
-    model.eval()
-    model.to(device)
-    
-    all_probs = []
+    probs = predict_liveness(loader, model, device)
+    if len(probs) != len(processed_data.images):
+        raise ValueError(f"Mismatch: {len(probs)} scores vs {len(processed_data.images)} faces.")
 
-    # 1. Robust Type Check
-    is_bunch = hasattr(original_data, 'images') and hasattr(test_data_paths, 'images')
+    live_mask = probs >= threshold
+    if verbose:
+        print(f"\nLiveness check (Tf={threshold}):")
+        for path, p in zip(processed_data.paths, probs):
+            print(f"  {os.path.basename(str(path))}: score={p:.4f} -> {'LIVE' if p >= threshold else 'FAKE'}")
+        print(f"  Live: {live_mask.sum()} | Fake (removed): {(~live_mask).sum()}")
 
-    if is_bunch:
-        total_images = len(original_data.images)
-        # Sanity check: Ensure both arrays have the same length
-        if len(test_data_paths.images) != total_images:
-            raise ValueError(f"Mismatch! Detected faces ({total_images}) vs Paths ({len(test_data_paths.images)})")
+    # CHW -> HWC copies (the input Bunch is left untouched)
+    live_faces = np.empty(int(live_mask.sum()), dtype=object)
+    for k, idx in enumerate(np.where(live_mask)[0]):
+        live_faces[k] = np.transpose(processed_data.images[idx], (1, 2, 0))
 
-    if verbose: print(f" Analyzing {total_images} faces...")
-    # 2. Get Scores
-    with torch.no_grad():
-        for batch in loader:
-            # Handle Loader formats: (images, targets) OR just (images)
-            if isinstance(batch, (list, tuple)):
-                images = batch[0]
-            else:
-                images = batch
-            
-            images = images.to(device)
-            logits = model(images)
-            probs = torch.sigmoid(logits).cpu().view(-1).numpy()
-            all_probs.extend(probs)
-    
-    all_probs = np.array(all_probs)
-    if verbose: print(f" -> Liveness Probabilities: {all_probs}")
-    
-    # 3. Create Mask
-    live_mask = all_probs >= threshold
-    n_kept = np.sum(live_mask)
-    n_removed = total_images - n_kept
-    
-    if verbose: print(f" -> Total Faces:   {total_images}")
-    if verbose: print(f" -> Fakes Removed: {n_removed}")
-    if verbose: print(f" -> Lives Kept:    {n_kept}")
-    
-    # Handle case where everything is rejected
-    if n_kept == 0:
-        print("WARNING: All faces were classified as Fake!")
-        empty_bunch_det = Bunch(images=np.array([]), target=np.array([]), target_names=original_data.target_names)
-        empty_bunch_path = Bunch(images=np.array([]), target=np.array([]), target_names=test_data_paths.target_names)
-        return empty_bunch_det, empty_bunch_path
-
-    # 4. Apply Mask correctly to BOTH datasets
-    # A. Process Detected Faces (original_data)
-    # Permute dimensions: (C, H, W) -> (H, W, C) for display/saving usage later
-    for i in range(len(original_data.images)):
-        if original_data.images[i].shape[0] == 3: # Check if Channels-first
-            original_data.images[i] = np.transpose(original_data.images[i], (1, 2, 0))
-            
-    filtered_detected_faces = Bunch(
-        images=original_data.images[live_mask],
-        target=original_data.target[live_mask],
-        target_names=original_data.target_names
+    return Bunch(
+        images=live_faces,
+        target=processed_data.target[live_mask],
+        paths=processed_data.paths[live_mask],
+        liveness_scores=probs[live_mask],
+        target_names=processed_data.target_names,
     )
-    
-    # B. Process File Paths (test_data_paths)
-    filtered_file_paths = Bunch(
-        images=test_data_paths.images[live_mask],
-        target=test_data_paths.target[live_mask],
-        target_names=test_data_paths.target_names
-    )
-    
-    return filtered_detected_faces, filtered_file_paths

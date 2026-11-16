@@ -1,181 +1,147 @@
+"""
+Face detection module.
+
+Unified wrapper around three detectors (Viola-Jones, Dlib HOG+SVM, MTCNN) that
+converts their outputs to a common (x, y, w, h) bounding-box format, crops the
+primary face of each image and returns a normalized, fixed-size ROI.
+"""
 import cv2
 import numpy as np
-from facenet_pytorch import MTCNN as MTCNN_PyTorch  # PyTorch version instead of TensorFlow
-import dlib
-import matplotlib.pyplot as plt
-import pandas as pd
+import torch
 from sklearn.utils import Bunch
-import torch
-from IPython.display import display
-from PIL import Image
-import torch
 
 
-
-# WRAPPERS FOR DIFFERENT FACE DETECTION LIBRARIES
-# These wrappers will take the raw image and return a standardized list of bounding boxes (x, y, w, h)
-
-
+# ---------------------------------------------------------------------------
+# Detector wrappers: each returns a list of (x, y, w, h) boxes
+# ---------------------------------------------------------------------------
 def detect_VJ(img, gray, model):
-    """Wrapper for Viola & Jones."""
-    # VJ uses grayscale
+    """Viola & Jones (OpenCV Haar cascade). Works on grayscale images."""
     return model.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
 
 
-
 def detect_MTCNN(img, gray, model):
-    """Wrapper for MTCNN (facenet_pytorch version)."""
-    # facenet_pytorch MTCNN expects RGB images (already in RGB from caller)
-    # model.detect returns (boxes, probs) where boxes is Nx4 array or None
-    # Convert numpy array to PIL Image
-    img_pil = Image.fromarray(img)
-    boxes, probs = model.detect(img)
+    """
+    MTCNN (facenet-pytorch). Works on RGB images.
+
+    Note: `MTCNN.detect()` always returns *all* detected faces (`keep_all` only
+    affects the cropping API). With the default `select_largest=True` the boxes
+    are sorted by area, so the first box is the largest face in the frame.
+    """
+    boxes, _ = model.detect(img)
     if boxes is None:
         return []
-    # Convert from [x1, y1, x2, y2] to [x, y, w, h] format
-    result = []
-    for box in boxes:
-        x1, y1, x2, y2 = box
-        x, y, w, h = int(x1), int(y1), int(x2 - x1), int(y2 - y1)
-        result.append((x, y, w, h))
-    return result
+    return [(int(x1), int(y1), int(x2 - x1), int(y2 - y1)) for x1, y1, x2, y2 in boxes]
 
 
 def detect_Dlib(img, gray, model):
-    """Wrapper for Dlib."""
-    # Dlib uses grayscale
+    """Dlib frontal face detector (HOG + linear SVM). Works on grayscale images."""
     rects = model(gray, 0)
-    # Convert dlib objects to tuples (x, y, w, h)
     return [(r.left(), r.top(), r.width(), r.height()) for r in rects]
 
 
+def build_detector(method):
+    """Instantiates the requested detector. Heavy dependencies are imported lazily."""
+    if method == 'VJ':
+        model = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        return model, detect_VJ
+    if method == 'MTCNN':
+        from facenet_pytorch import MTCNN
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        return MTCNN(keep_all=False, min_face_size=20, device=device), detect_MTCNN
+    if method == 'Dlib':
+        import dlib  # optional dependency, only needed for the detector comparison
+        return dlib.get_frontal_face_detector(), detect_Dlib
+    raise ValueError(f"Unknown method: {method}. Choose among 'VJ', 'MTCNN', 'Dlib'.")
 
 
-def detect_faces(unprocessed_dataset, method='MTCNN', target_names=None, verbose=False, detected_face_size=(224, 224), cnn=False):
+def _clip_box(x, y, w, h, img_w, img_h):
+    """Clips a (x, y, w, h) box to the image borders and returns (x1, y1, x2, y2)."""
+    x1, y1 = max(0, x), max(0, y)
+    x2, y2 = min(img_w, x + w), min(img_h, y + h)
+    return x1, y1, x2, y2
+
+
+# ---------------------------------------------------------------------------
+# Main pipeline
+# ---------------------------------------------------------------------------
+def detect_faces(unprocessed_dataset, method='MTCNN', target_names=None, verbose=False,
+                 detected_face_size=(224, 224), cnn=False):
     """
-    Takes a dataset (Bunch object) containing file paths.
-    For each image path, it loads the image, detects faces and selects the BEST face found
-    (with keep_all=False, so at most one face is returned).
+    Loads every image of a dataset of FILE PATHS, detects faces and keeps the
+    primary face of each image (the first box returned by the detector).
+
     Args:
-        unprocessed_dataset: Bunch object with 'images' as file paths and 'target' as labels.
-        method: Face detection method ('VJ', 'MTCNN', 'Dlib').
-        target_names: Optional list of target names.
-        verbose: If True, prints progress and dropped image reasons.
-        detected_face_size: Tuple specifying the size to which detected faces are resized.
-        cnn: If True, returns images in CHW format for CNN input; otherwise HWC format.
+        unprocessed_dataset: Bunch with `.images` (file paths) and `.target` (labels).
+        method: 'VJ', 'MTCNN' or 'Dlib'.
+        target_names: Optional array of class names (defaults to the dataset's).
+        verbose: Print progress and the reason of every dropped image.
+        detected_face_size: Output size of the face ROI.
+        cnn: If True, faces are returned in CHW format (CNN input), otherwise HWC.
+
+    Returns:
+        Bunch with:
+          .images       -> object array of float32 faces in [0, 1]
+          .target       -> labels of the kept images
+          .paths        -> file paths of the kept images (aligned with .images)
+          .kept_indices -> indices of the kept images in the input dataset
+          .target_names -> class names
+        Images where no face is found are dropped, therefore `.paths` must be
+        used (instead of the input paths) whenever faces and files are matched.
     """
-    if verbose:print(f"\nStarting face detection using {method} method\nRunning with image_size={detected_face_size}")
-    
-    
-    # Resolve target_names
     if target_names is None:
         target_names = getattr(unprocessed_dataset, 'target_names', None)
-    
-    # 1. Initialize Models 
-    if verbose:print(f"Initializing {method} detector...")
-    if method == 'VJ':
-        model = cv2.CascadeClassifier(cv2.samples.findFile(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'))
-        detect_func = detect_VJ
-    elif method == 'MTCNN':
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        from facenet_pytorch import MTCNN as MTCNN_PyTorch
-        # keep_all=False ensures MTCNN selects the best face internally
-        model = MTCNN_PyTorch(keep_all=False, min_face_size=20, device=device)
-        detect_func = detect_MTCNN
-    elif method == 'Dlib':
-        model = dlib.get_frontal_face_detector()
-        detect_func = detect_Dlib
-    else:
-        raise ValueError(f"Unknown method: {method}")
 
-    # 2. Storage
-    processed_images = []
-    processed_targets = []
-    dropped_counts = {"No Face": 0}
+    if verbose:
+        print(f"\nStarting face detection using {method} (output size {detected_face_size})")
+    model, detect_func = build_detector(method)
+
+    processed_images, processed_targets, kept_paths, kept_indices = [], [], [], []
+    dropped = {"load_failed": 0, "no_face": 0, "empty_roi": 0}
     total_images = len(unprocessed_dataset.images)
-    if verbose: print(f"\nProcessing {total_images} images...")
-    
-    # 3. Iterate
+
     for i in range(total_images):
-        # Load Image from Path 
         img_path = unprocessed_dataset.images[i]
         target_id = unprocessed_dataset.target[i]
-        person_name = target_names[target_id] if target_names is not None else f"ID_{target_id}"
 
-        # Load from disk
-        try:
-            img_bgr = cv2.imread(img_path)
-            if img_bgr is None:
-                if verbose: print(f"DROPPED [Load Failed]: {img_path}")
-                dropped_counts["No Face"] += 1
-                continue
-            img_input = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        except Exception as e:
-            if verbose: print(f"DROPPED [Read Error]: {img_path} ({e})")
-            dropped_counts["No Face"] += 1
+        img_bgr = cv2.imread(str(img_path))
+        if img_bgr is None:
+            dropped["load_failed"] += 1
+            if verbose: print(f"DROPPED [Load Failed]: {img_path}")
             continue
-        
-        # Convert to 0-255 uint8
-        if img_input.dtype == np.float64 or img_input.dtype == np.float32 or img_input.max() <= 1.0:
-            img_uint8 = (img_input * 255).astype(np.uint8)
-        else:
-            img_uint8 = img_input.astype(np.uint8)
-            
-        # Ensure RGB/Gray formats
-        if img_uint8.ndim == 2:
-            img_rgb = cv2.cvtColor(img_uint8, cv2.COLOR_GRAY2RGB)
-            img_gray = img_uint8
-        else:
-            img_rgb = img_uint8
-            img_gray = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2GRAY)
-            
-        # Detect Faces
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        img_gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
         faces = detect_func(img_rgb, img_gray, model)
-        
-        
-        # With keep_all=False, 'faces' contains at most 1 element (the best one)
-        if len(faces) > 0:
-            # Take the first (and only) face directly
-            (x, y, w, h) = faces[0]
-            # Boundary checks
-            x, y = max(0, x), max(0, y)
-            w = min(w, img_uint8.shape[1] - x)
-            h = min(h, img_uint8.shape[0] - y)
-            # Crop
-            best_face_roi = img_rgb[y:y+h, x:x+w]
-            # Save (Resize + Transpose)
-            if best_face_roi is not None and best_face_roi.size > 0:
-                # Resize to detected_face_size
-                best_face_roi = cv2.resize(best_face_roi, detected_face_size)
-                # Normalize (0-1)
-                face_roi_float = best_face_roi.astype(np.float32) / 255.0
-                # Transpose HWC -> CHW
-                if cnn:
-                    face_roi_tensor = np.transpose(face_roi_float, (2, 0, 1)) 
-                    processed_images.append(face_roi_tensor)
-                else:
-                    processed_images.append(face_roi_float)
-                processed_targets.append(target_id)
-            else:
-                if verbose: print(f"DROPPED [Empty ROI]: Image {i} of {person_name} at dir {img_path}")
-                dropped_counts["No Face"] += 1
-        else:
-            # No face found
-            if verbose: print(f"DROPPED [No Face Detected]: Image {i} of {person_name} at dir {img_path}")
-            dropped_counts["No Face"] += 1
+        if len(faces) == 0:
+            dropped["no_face"] += 1
+            if verbose: print(f"DROPPED [No Face Detected]: {img_path}")
+            continue
 
-    # 4. Package
-    n_kept = len(processed_images)
-    processed_images_arr = np.empty(n_kept, dtype=object)
-    for k in range(n_kept):
-        processed_images_arr[k] = processed_images[k]
+        x1, y1, x2, y2 = _clip_box(*faces[0], img_rgb.shape[1], img_rgb.shape[0])
+        roi = img_rgb[y1:y2, x1:x2]
+        if roi.size == 0:
+            dropped["empty_roi"] += 1
+            if verbose: print(f"DROPPED [Empty ROI]: {img_path}")
+            continue
 
-    processed_dataset = Bunch(
-        images=processed_images_arr, 
-        target=np.array(processed_targets),
-        target_names=target_names
-    )
+        face = cv2.resize(roi, detected_face_size).astype(np.float32) / 255.0
+        processed_images.append(np.transpose(face, (2, 0, 1)) if cnn else face)
+        processed_targets.append(target_id)
+        kept_paths.append(img_path)
+        kept_indices.append(i)
+
+    images_arr = np.empty(len(processed_images), dtype=object)
+    for k, face in enumerate(processed_images):
+        images_arr[k] = face
+
     if verbose:
-        print(f"Dropped images summary: {dropped_counts}") 
-        print(f"Kept {n_kept} out of {total_images} images.")
-    return processed_dataset
+        print(f"Dropped images summary: {dropped}")
+        print(f"Kept {len(processed_images)} out of {total_images} images.")
+
+    return Bunch(
+        images=images_arr,
+        target=np.array(processed_targets),
+        paths=np.array(kept_paths, dtype=object),
+        kept_indices=np.array(kept_indices, dtype=int),
+        target_names=target_names,
+    )

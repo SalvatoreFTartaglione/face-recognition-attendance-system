@@ -1,11 +1,31 @@
-import numpy as np
+"""
+Matching (identification / verification) and threshold calibration.
+
+All embeddings are assumed to be L2-normalised, so the dot product equals the
+cosine similarity (1 = identical, higher = more similar).
+"""
 import matplotlib.pyplot as plt
-from sklearn.metrics import roc_curve, auc
+import numpy as np
+import seaborn as sns
+from sklearn.metrics import auc, roc_curve
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.model_selection import StratifiedKFold
-import pandas as pd
-import seaborn as sns
 
+
+def fnir_curve(probe_embs, probe_labels, gal_embs, gal_labels, thresholds):
+    """
+    False Negative Identification Rate for every threshold (closed-set probes).
+
+    A probe is a miss when its Rank-1 identity is wrong OR its Rank-1 score is
+    below the threshold. Unlike the image-to-image FRR, this is the actual
+    error of the 1:N search.
+    """
+    sim = np.dot(probe_embs, gal_embs.T)
+    top_idx = np.argmax(sim, axis=1)
+    top_score = sim[np.arange(len(sim)), top_idx]
+    correct = np.asarray(gal_labels)[top_idx] == np.asarray(probe_labels)
+    hits = correct[None, :] & (top_score[None, :] >= np.asarray(thresholds)[:, None])
+    return 1.0 - hits.mean(axis=1)
 
 
 
@@ -80,12 +100,28 @@ def identify_user(probe_emb, gal_embs, gal_labels, gal_names, threshold=0.5):
     else:
         candidate_name = f"ID_{predicted_label_id}"
 
-    # 4. Threshold Check (Open-Set Recognition)
-    # Note: Logic flipped check if score is GREATER than threshold.
-    if max_score >= threshold:
-        return True, candidate_name, max_score
-    else:
-        return False, candidate_name, max_score
+    # 4. Threshold Check (Open-Set Recognition): accept only if score >= threshold
+    return bool(max_score >= threshold), candidate_name, max_score
+
+
+
+def rank_candidates(probe_emb, gal_embs, gal_labels, gal_names, threshold):
+    """
+    Open-set identification output required by the system specification: the
+    list of enrolled users whose score is above the threshold, ordered by
+    matching score (best first). Each identity is scored with its best template.
+
+    Returns:
+        list of dict: [{"id", "name", "score"}, ...] (empty list = reject / unknown user)
+    """
+    scores = cosine_similarity(np.asarray(probe_emb).reshape(1, -1), gal_embs)[0]
+    candidates = []
+    for label in np.unique(gal_labels):
+        best = float(np.max(scores[gal_labels == label]))
+        if best >= threshold:
+            name = gal_names[label] if label < len(gal_names) else f"ID_{label}"
+            candidates.append({"id": int(label), "name": str(name), "score": best})
+    return sorted(candidates, key=lambda c: c["score"], reverse=True)
 
 
 
@@ -93,36 +129,29 @@ def identify_user(probe_emb, gal_embs, gal_labels, gal_names, threshold=0.5):
 def verify_user(claimed_id, probe_embedding, gallery_embeddings, gallery_labels, threshold):
     """
     User Verification (1:1)
-    Checks if the probe matches the specific claimed identity.
+    Matches the probe ONLY against the gallery templates of the claimed identity.
     Args:
         claimed_id (int): The ID the user claims to be.
         probe_embedding (np.array): Shape (512,). The live face embedding.
         gallery_embeddings (np.array): Shape (N, 512). The gallery database.
         gallery_labels (np.array): Shape (N,). IDs for the gallery.
-        threshold (float): Similarity threshold (0 to 1). Score > Threshold = "MATCH".
+        threshold (float): Similarity threshold Tv. Score >= Tv -> "MATCH".
     Returns:
-        tuple: (best_score, decision)
+        tuple: (best_score, decision) with decision in {"MATCH", "REJECT"}.
+    Raises:
+        ValueError: if the claimed ID is not enrolled.
     """
     # 1. Select only the templates belonging to the Claimed ID
     user_indices = np.where(gallery_labels == claimed_id)[0]
-    
     if len(user_indices) == 0:
-        return 0.0, "REJECT (User not in Gallery)"
-        
-    claimed_user_embeddings = gallery_embeddings[user_indices]
-    
-    # 2. Compute similarity against the claimed user's templates
-    probe_emb_reshaped = probe_embedding.reshape(1, -1)
-    sim_scores = cosine_similarity(probe_emb_reshaped, claimed_user_embeddings)[0]
-    
-    # 3. Find the best match among this user's templates
-    best_score = np.max(sim_scores)
-    
-    # 4. Binary Decision
-    if best_score > threshold:
-        return best_score, "MATCH"
-    else:
-        return best_score, "REJECT"
+        raise ValueError(f"Claimed ID {claimed_id} is not enrolled in the gallery.")
+
+    # 2. Similarity against the claimed user's templates, keep the best one
+    sim_scores = cosine_similarity(np.asarray(probe_embedding).reshape(1, -1), gallery_embeddings[user_indices])[0]
+    best_score = float(np.max(sim_scores))
+
+    # 3. Binary decision (same >= convention used during threshold tuning)
+    return best_score, ("MATCH" if best_score >= threshold else "REJECT")
     
 
     
@@ -306,107 +335,34 @@ def compute_liveness_threshold_kfold(labels, probs, k=4):
 
 
 
-def compute_far_frr_verification_on_probes(threshold, probe_embs_norm, probe_labels, gal_embs, gal_labels, live_demo=False):
+def compute_far_frr_verification_on_probes(threshold, probe_embs_norm, probe_labels, gal_embs, gal_labels, verbose=True):
     """
-    Computes FAR and FRR using rigorous Image-to-Image comparison (All-Pairs).
-    Matches the PRINT OUTPUT of the old function when live_demo=True.
+    Computes verification FAR and FRR with an Image-to-Image (all-pairs) protocol:
+    every probe is compared with every gallery template; same-identity pairs are
+    genuine attempts, different-identity pairs are impostor attempts.
     Args:
-        threshold (float): The Verification Threshold (Tv).
+        threshold (float): The Verification Threshold (Tv). Score >= Tv -> accept.
         probe_embs_norm (np.array): Normalized probe embeddings.
         probe_labels (np.array): Labels for the probe embeddings.
         gal_embs (np.array): Gallery embeddings.
         gal_labels (np.array): Labels for the gallery embeddings.
-        live_demo (bool): If True, prints detailed per-probe results.
+        verbose (bool): Print a summary.
     Returns:
         tuple: (FAR, FRR)
     """
-    # Initialize Global Counters
-    false_accepts = 0       
-    impostor_attempts = 0   
-    false_rejects = 0       
-    genuine_attempts = 0    
+    sim_matrix = np.dot(probe_embs_norm, gal_embs.T)                      # (N_probes, N_gallery)
+    genuine_mask = np.asarray(probe_labels)[:, None] == np.asarray(gal_labels)[None, :]
 
-    # Pre-calculate similarity matrix for speed (N_probes x N_gallery)
-    sim_matrix = np.dot(probe_embs_norm, gal_embs.T)
+    genuine_scores = sim_matrix[genuine_mask]
+    impostor_scores = sim_matrix[~genuine_mask]
+    genuine_attempts, impostor_attempts = len(genuine_scores), len(impostor_scores)
+    false_rejects = int(np.sum(genuine_scores < threshold))
+    false_accepts = int(np.sum(impostor_scores >= threshold))
 
-    for i in range(len(probe_embs_norm)):
-        true_id = probe_labels[i]
-        
-        # Get all scores for this probe against the gallery
-        probe_scores = sim_matrix[i]
-        
-        # Create boolean masks
-        mask_genuine = (gal_labels == true_id)
-        mask_impostor = ~mask_genuine
-        
-        # ---------------------------------------------------------
-        # PART A: GENUINE CHECKS (FRR)
-        # ---------------------------------------------------------
-        gen_scores = probe_scores[mask_genuine]
-        
-        # Metrics Calculation (Image-to-Image)
-        n_gen = len(gen_scores)
-        n_fr = np.sum(gen_scores < threshold) 
-        genuine_attempts += n_gen
-        false_rejects += n_fr
-        
-        if live_demo and n_gen > 0:
-            best_gen_score = np.max(gen_scores)
-            decision = "MATCH" if best_gen_score >= threshold else "REJECT"
-            if decision == 'MATCH':
-                print(f"\nCLAIM with probe {i+1}/{len(probe_embs_norm)} (ID {true_id}) -> Score: {best_gen_score:.4f} -> MATCH")
-            else:
-                print(f"\nCLAIM with probe {i+1}/{len(probe_embs_norm)} (ID {true_id}) -> Score: {best_gen_score:.4f} -> REJECT")
-            
-        # ---------------------------------------------------------
-        # PART B: IMPOSTOR CHECKS (FAR)
-        # ---------------------------------------------------------
-        imp_scores = probe_scores[mask_impostor]
-        imp_ids = gal_labels[mask_impostor] 
-        
-        n_imp = len(imp_scores)
-        n_fa = np.sum(imp_scores >= threshold) 
-        impostor_attempts += n_imp
-        false_accepts += n_fa
-        
-        # --- VISUALIZATION: SHOW ONLY FALSE ACCEPTS ---
-        if live_demo:
-            # Group by Identity to simulate user accounts
-            df_imp = pd.DataFrame({'id': imp_ids, 'score': imp_scores})
-            
-            # Find max score per impostor identity
-            max_imp_by_id = df_imp.groupby('id')['score'].max().reset_index()
-            
-            # Filter: Keep only those ABOVE threshold (The Security Breaches)
-            filtered_imp = max_imp_by_id[max_imp_by_id['score'] >= threshold].copy()
-            
-            # Sort Descending
-            filtered_imp = filtered_imp.sort_values(by='score', ascending=False)
-            
-            # --- CRITICAL CHANGE: Label them as FALSE ACCEPT ---
-            filtered_imp['Decision'] = "FALSE ACCEPT" 
-            
-            if not filtered_imp.empty:
-                df_results = pd.DataFrame({
-                    "Rank": range(1, len(filtered_imp) + 1),
-                    "Impostor ID": filtered_imp['id'],
-                    "Score": filtered_imp['score'].apply(lambda x: f"{x:.4f}"),
-                    "Decision": filtered_imp['Decision']
-                })
-
-                print("-" * 60)
-                print(f" [!] SECURITY ALERT: This user has been misidentified!")
-                print("-" * 60)
-                print(df_results.to_markdown(index=False, tablefmt="grid")) 
-                print("\n")
-
-    # =================
-    # FINAL CALCULATION 
-    # ==================
     far = false_accepts / impostor_attempts if impostor_attempts > 0 else 0.0
     frr = false_rejects / genuine_attempts if genuine_attempts > 0 else 0.0
-    
-    if not live_demo:
+
+    if verbose:
         print(f"{'='*50}")
         print(f"CALCULATING FAR & FRR")
         print(f"Tv = {threshold:.4f}")
@@ -569,10 +525,21 @@ def compute_open_set_far_on_probes(threshold, probe_embs, probe_labels, gal_embs
 
 
 
-def find_optimal_thresholds_kfold(embeddings, labels, k_folds=5, step=0.001, desired_far=0.001, verbose=True, offset=0.0, gal_names=None, bias_tv=0.0, bias_ti=0.0):
+def find_optimal_thresholds_kfold(embeddings, labels, k_folds=5, step=0.001, desired_far=0.001, verbose=True, gal_names=None, bias_tv=0.0, bias_ti=0.0):
     """
-    Performs K-Fold Cross-Validation using STRICT SECURITY LOGIC.
-    Visualizes Verification and Identification metrics in SEPARATE plots.
+    Calibrates Tv and Ti with Stratified K-Fold cross-validation on the GALLERY
+    (image-disjoint folds: K-1 folds act as gallery, 1 fold as validation probes).
+
+    For each fold:
+      - Tv = min{t : FAR_all-impostor(t) <= desired_far} + bias_tv   (1:1 verification)
+      - Ti = min{t : FAR_max-impostor(t) <= desired_far} + bias_ti   (1:N open-set identification)
+    The final thresholds are the averages across folds.
+
+    Returns:
+        dict with keys 'Tv', 'Ti', 'std_Tv', 'std_Ti', 'fold_Tv', 'fold_Ti' and
+        'metrics' (mean of the per-fold verification/identification error rates).
+        Named keys are used on purpose: a positional tuple made it easy to swap
+        the two standard deviations when unpacking.
     """
     skf = StratifiedKFold(n_splits=k_folds, shuffle=True, random_state=42)
     
@@ -614,15 +581,12 @@ def find_optimal_thresholds_kfold(embeddings, labels, k_folds=5, step=0.001, des
         selected_tv = thresholds[safe_indices_tv[0]] + bias_tv if len(safe_indices_tv) > 0 else 1.0
         
         # B. Identification (1:N)
-        fnir_list = frr_list 
+        fnir_list = fnir_curve(fold_val_emb, fold_val_lbl, fold_gallery_emb, fold_gallery_lbl, thresholds)
         far_list_ident = np.sum(imp_scores_ident >= thresholds[:, None], axis=1) / len(imp_scores_ident)
-        
+
         safe_indices_ti = np.where(far_list_ident <= desired_far)[0]
         selected_ti = thresholds[safe_indices_ti[0]] + bias_ti if len(safe_indices_ti) > 0 else 1.0
-        
-        selected_tv = selected_tv + offset
-        selected_ti = selected_ti + offset
-        
+
         tv_scores.append(selected_tv)
         ti_scores.append(selected_ti)
 
@@ -630,7 +594,7 @@ def find_optimal_thresholds_kfold(embeddings, labels, k_folds=5, step=0.001, des
         if verbose:
             print(f"   Tv: {selected_tv:.4f} | Ti: {selected_ti:.4f}")
             
-        v_far, v_frr = compute_far_frr_verification_on_probes(selected_tv, fold_val_emb, fold_val_lbl, fold_gallery_emb, fold_gallery_lbl, live_demo=False)
+        v_far, v_frr = compute_far_frr_verification_on_probes(selected_tv, fold_val_emb, fold_val_lbl, fold_gallery_emb, fold_gallery_lbl, verbose=verbose)
         i_fnir = compute_fnir_identification_on_probes(selected_ti, fold_val_emb, fold_val_lbl, fold_gallery_emb, fold_gallery_lbl, gal_names)
         o_far = compute_open_set_far_on_probes(threshold=selected_ti, probe_embs=fold_val_emb, probe_labels=fold_val_lbl, gal_embs=fold_gallery_emb, gal_labels=fold_gallery_lbl, gal_names=gal_names)
         
@@ -668,8 +632,12 @@ def find_optimal_thresholds_kfold(embeddings, labels, k_folds=5, step=0.001, des
     print(f"{'Identification Miss (FNIR)':<30} | {avg_metrics['ident_fnir']*100:.2f}%     | ±{std_metrics['ident_fnir']*100:.2f}%")
     print(f"{'Open-Set FAR (Ti)':<30} | {avg_metrics['open_set_far']*100:.2f}%     | ±{std_metrics['open_set_far']*100:.2f}%")
     print("="*60)
-    
-    return avg_tv, avg_ti, std_tv, std_ti
+    print(f"Tv = {avg_tv:.4f} (std {std_tv:.4f}) | Ti = {avg_ti:.4f} (std {std_ti:.4f})")
+
+    return {
+        "Tv": avg_tv, "Ti": avg_ti, "std_Tv": std_tv, "std_Ti": std_ti,
+        "fold_Tv": tv_scores, "fold_Ti": ti_scores, "metrics": avg_metrics,
+    }
 
 
 
@@ -703,9 +671,8 @@ def plot_performance(probe_embs, probe_labels, gal_embs, gal_labels, Tv, Ti):
     frr_list = np.sum(gen_scores < thresholds[:, None], axis=1) / len(gen_scores)
     far_list_verif = np.sum(imp_scores_verif >= thresholds[:, None], axis=1) / len(imp_scores_verif)
     
-    # Identification Metrics (1:N)
-    # FNIR (False Negative Identification Rate) is mathematically equivalent to FRR here
-    fnir_list = frr_list 
+    # Identification Metrics (1:N): per-probe Rank-1 miss rate
+    fnir_list = fnir_curve(probe_embs, probe_labels, gal_embs, gal_labels, thresholds)
     far_list_ident = np.sum(imp_scores_ident >= thresholds[:, None], axis=1) / len(imp_scores_ident)
 
     # --- PLOTTING ---
@@ -800,7 +767,7 @@ def plot_threshold_tuning_results(axes, fold_idx, scores, metrics, thresholds, s
     far_verif = metrics['far_verif']
     frr = metrics['frr']
     far_ident = metrics['far_ident']
-    fnir = metrics['fnir'] # Same as FRR mathematically
+    fnir = metrics['fnir'] # Rank-1 miss rate (wrong identity or score below threshold)
 
     # --- Plot 1: Verification Distribution (Gen vs All-Imp) ---
     ax_v_dist = axes[0]
