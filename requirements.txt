@@ -1,0 +1,18 @@
+# Core pipeline (detection, recognition, liveness, quality, demo)
+numpy
+pandas
+scikit-learn
+scikit-image
+opencv-python
+Pillow
+matplotlib
+seaborn
+torch>=2.0
+torchvision
+facenet-pytorch      # MTCNN + InceptionResnetV1 (VGGFace2 / CASIA-WebFace)
+jupyter
+
+# Optional: only needed to reproduce the comparisons in BBA_Project_G14.ipynb
+# deepface           # ArcFace, Facenet512, VGG-Face, GhostFaceNet, SFace (TensorFlow backend)
+# tf-keras
+# dlib               # HOG + SVM face detector (detector comparison)
