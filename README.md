@@ -74,7 +74,7 @@ Three detectors were compared on all 520 images:
 **MTCNN** was selected. It is the only detector that found every face, and its bounding boxes were the most
 consistent. Viola & Jones is faster but produced visibly mis-cropped faces.
 
-The detection module ([`face_detection.py`](face_detection.py)) wraps the three libraries behind a single interface
+The detection module ([`face_detection.py`](face_auth/face_detection.py)) wraps the three libraries behind a single interface
 that returns `(x, y, w, h)` boxes. It keeps the primary face of each image, then crops it, resizes it to 224×224 and
 normalises it to [0, 1]. Faces can be returned in CHW format for the liveness CNN.
 
@@ -163,7 +163,7 @@ no ranking errors.
 
 ## 5. Liveness detection (`Tf`)
 
-The replay-attack detector ([`liveness_detector.py`](liveness_detector.py)) is a **MobileNetV2** initialised with
+The replay-attack detector ([`liveness_detector.py`](face_auth/liveness_detector.py)) is a **MobileNetV2** initialised with
 ImageNet weights and **fully fine-tuned**. Its 1000-class head is replaced by a single liveness logit.
 
 - **Input:** the same MTCNN face crops the live system produces, so training matches deployment.
@@ -188,7 +188,7 @@ distribution makes every threshold in the central range equivalent. The neutral 
 ## 6. Image quality (`Tq`)
 
 The acquisition module rejects low-quality samples before matching and asks the user for a new acquisition
-([`face_quality.py`](face_quality.py)).
+([`face_quality.py`](face_auth/face_quality.py)).
 
 - **Quality measure: MagFace.** General image-quality metrics such as sharpness or noise correlate poorly with
   recognition accuracy. MagFace instead learns embeddings whose **magnitude** grows with the sample's recognisability,
@@ -223,18 +223,25 @@ test-set analysis.
 ## Repository structure
 
 ```
-├── BBA_Project_G14.ipynb   # Development notebook: detector/extractor benchmarks, threshold tuning,
-│                           # liveness training, quality calibration, final evaluation
-├── system_demo.ipynb       # Live demo: Enrollment / Identification / Verification
-├── live_system_demo.py     # End-to-end session pipeline + command-line interface
-├── face_detection.py       # Viola-Jones / Dlib / MTCNN wrappers and face cropping
-├── liveness_detector.py    # MobileNetV2 replay-attack detector, dataset split, evaluation
-├── face_quality.py         # MagFace quality, quality gate, ERC calibration
-├── threshold_tuning.py     # Identification, verification, K-fold threshold calibration, metrics
-├── utilities.py            # Data loading, embedding extraction (facenet-pytorch / DeepFace), gallery, plots
-├── iresnet.py              # MagFace iResNet backbone (third-party, Apache-2.0)
-├── Models/README.md        # How to obtain the model weights
-└── docs/                   # Report (PDF) and figures
+├── face_auth/                         # Python modules of the system
+│   ├── face_detection.py              # Viola-Jones / Dlib / MTCNN wrappers and face cropping
+│   ├── liveness_detector.py           # MobileNetV2 replay-attack detector, dataset split, evaluation
+│   ├── face_quality.py                # MagFace quality, quality gate, ERC calibration
+│   ├── threshold_tuning.py            # Identification, verification, K-fold threshold calibration, metrics
+│   ├── utilities.py                   # Data loading, embedding extraction, gallery, plots
+│   ├── live_system_demo.py            # End-to-end session pipeline + command-line interface
+│   └── iresnet.py                     # MagFace iResNet backbone (third-party, Apache-2.0)
+├── notebooks/
+│   ├── 01_face_authentication.ipynb   # Development: detector/extractor benchmarks, threshold tuning,
+│   │                                  # liveness training, quality calibration, final evaluation
+│   └── 02_system_demo.ipynb           # Live demo: Enrollment / Identification / Verification
+├── models/
+│   └── README.md                      # How to obtain the model weights
+├── docs/
+│   ├── report.pdf                     # Technical report
+│   └── figures/                       # Plots used in this README
+├── requirements.txt
+└── LICENSE
 ```
 
 ---
@@ -247,20 +254,20 @@ python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\act
 pip install -r requirements.txt
 ```
 
-1. **Model weights.** Follow [`Models/README.md`](Models/README.md) to get `magface_iresnet50_MS1MV2_ddp_fp32.pth`
+1. **Model weights.** Follow [`models/README.md`](models/README.md) to get `magface_iresnet50_MS1MV2_ddp_fp32.pth`
    and `liveness_model.pth`.
 2. **Gallery.** Enroll users with the demo (Enrollment mode), or build the gallery from a dataset with
-   `BBA_Project_G14.ipynb`. The dataset must have this layout:
+   `notebooks/01_face_authentication.ipynb`. The dataset must have this layout:
    ```
    Dataset/face_recognition/{galleries,probes}/subject_XX/**/*.jpg
    Dataset/liveness_detection/Liveness_Dataset/{galleries,probes}/{real,fake}/subject_XX/*.jpg
    ```
-3. **Run the demo** in `system_demo.ipynb`, or from the command line. Put up to 3 pictures of the user in a folder:
+3. **Run the demo** in `notebooks/02_system_demo.ipynb`, or from the command line. Put up to 3 pictures of the user in a folder:
    ```bash
-   python live_system_demo.py enroll   --data-dir Test/alice --name alice
-   python live_system_demo.py identify --data-dir Test/alice
-   python live_system_demo.py verify   --data-dir Test/alice --claimed-id 0
-   python live_system_demo.py identify --data-dir Test/alice --no-liveness   # bypass the liveness detector
+   python face_auth/live_system_demo.py enroll   --data-dir Test/alice --name alice
+   python face_auth/live_system_demo.py identify --data-dir Test/alice
+   python face_auth/live_system_demo.py verify   --data-dir Test/alice --claimed-id 0
+   python face_auth/live_system_demo.py identify --data-dir Test/alice --no-liveness   # bypass the liveness detector
    ```
    Each run prints the decision and the processing time of every stage. If no sample passes the liveness or
    quality checks, it asks for a new acquisition.

@@ -9,8 +9,8 @@ liveness_test/
 *.csv
 
 # --- Model weights (download instructions in models/README.md) ---
-Models/*
-!Models/README.md
+models/*
+!models/README.md
 *.pth
 *.pkl
 *.zip

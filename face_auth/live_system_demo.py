@@ -34,7 +34,7 @@ DEFAULT_CONFIG = {
     "detector": "MTCNN",
     "embedding_model": "InceptionResnetV1-VGGFace2",
     "batch_size": 32,
-    "model_dir": "Models",
+    "model_dir": "models",
     "liveness_model_name": "liveness_model.pth",
     "magface_model_name": "magface_iresnet50_MS1MV2_ddp_fp32.pth",
     "database_dir": "System_Database/gallery",
