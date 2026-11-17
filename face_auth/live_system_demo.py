@@ -24,7 +24,7 @@ import liveness_detector
 import threshold_tuning as th_tuning
 import utilities as utils
 
-# Operating points calibrated in BBA_Project_G14.ipynb (see README, "Results").
+# Operating points calibrated in 01_face_authentication.ipynb (see README, "Results").
 DEFAULT_CONFIG = {
     "Tf": 0.5000,                      # liveness threshold
     "Ti": 0.6833,                      # identification threshold

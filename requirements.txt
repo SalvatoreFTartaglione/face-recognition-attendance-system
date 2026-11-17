@@ -12,7 +12,7 @@ torchvision
 facenet-pytorch      # MTCNN + InceptionResnetV1 (VGGFace2 / CASIA-WebFace)
 jupyter
 
-# Optional: only needed to reproduce the comparisons in BBA_Project_G14.ipynb
+# Optional: only needed to reproduce the comparisons in 01_face_authentication.ipynb
 # deepface           # ArcFace, Facenet512, VGG-Face, GhostFaceNet, SFace (TensorFlow backend)
 # tf-keras
 # dlib               # HOG + SVM face detector (detector comparison)
