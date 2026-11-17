@@ -35,30 +35,60 @@ flowchart LR
     E --> H["Verification 1:1<br/>claimed ID only, ≥ Tv"]
 ```
 
-| Module | Choice | Why |
-|--------|--------|-----|
-| Detection | **MTCNN** (facenet-pytorch) | Highest recall (520/520) compared with Viola-Jones and Dlib, with good crop quality |
-| Feature extraction | **InceptionResnetV1-VGGFace2** | Best cosine Rank-1 accuracy, about 30× faster than ArcFace at embedding extraction |
-| Liveness | **MobileNetV2**, ImageNet initialisation, full fine-tuning, BCE-with-logits | Lightweight CNN suited to mobile deployment |
-| Quality (FIQA) | **MagFace** feature magnitude | Measures *recognition utility* rather than perceptual quality |
-| Matching | Cosine similarity, best template per identity | Works with any number of templates per user |
+- **Enrollment** stores the features of every accepted sample, never the images.
+- **Identification** returns the list of enrolled users whose score is above `Ti`, ordered by score. An empty list
+  means the user is unknown.
+- **Verification** matches the probe only against the templates of the claimed identity and returns the score and
+  a MATCH / REJECT decision.
+
+All numbers below come from the experiments described in the [report](docs/report.pdf).
 
 ---
 
-## Results
+## 1. Dataset
 
-All numbers come from the original run of the experiments described in the report. The test set is the probe set:
-360 images of 20 subjects taken under varied lighting (natural light, low light, overexposure, directional light).
+A custom dataset was collected to reproduce real smartphone-based attendance:
 
-### Face detection (520 images)
+- **Face recognition:** 520 JPEG images (9:16, front camera, arm's length) of **20 subjects**.
+  - **Gallery** (enrollment): 160 images, 8 per subject.
+  - **Probes** (test set): 360 images, 18 per subject, taken under varied lighting: natural light, low light,
+    overexposure and directional light.
+- **Liveness:** 1 036 images. The 520 originals are labelled *Real*. The 516 *Fake* images are re-captures of the
+  same pictures shown on a computer screen, which simulates a replay attack. A custom dataset was preferred to public
+  anti-spoofing datasets to avoid domain shift with respect to the operating conditions.
 
-| Detector | Recall | Avg. time / image |
-|----------|:------:|:-----------------:|
-| **MTCNN** | **1.00** | 0.298 s |
-| Viola & Jones | 0.98 | 0.161 s |
-| Dlib (HOG + SVM) | 0.97 | 0.745 s |
+The dataset contains faces of real people, so it is **not published** (see [Privacy](#privacy)).
 
-### Feature extractor comparison (probe set)
+---
+
+## 2. Face detection
+
+Three detectors were compared on all 520 images:
+
+| Detector | Recall | Total time | Avg. time / image |
+|----------|:------:|:----------:|:-----------------:|
+| **MTCNN** (facenet-pytorch) | **1.00** (520/520) | 155 s | 0.298 s |
+| Viola & Jones (OpenCV) | 0.98 (510/520) | 82 s | 0.161 s |
+| Dlib (HOG + linear SVM) | 0.97 (505/520) | 366 s | 0.745 s |
+
+**MTCNN** was selected. It is the only detector that found every face, and its bounding boxes were the most
+consistent. Viola & Jones is faster but produced visibly mis-cropped faces.
+
+The detection module ([`face_detection.py`](face_detection.py)) wraps the three libraries behind a single interface
+that returns `(x, y, w, h)` boxes. It keeps the primary face of each image, then crops it, resizes it to 224×224 and
+normalises it to [0, 1]. Faces can be returned in CHW format for the liveness CNN.
+
+---
+
+## 3. Feature extraction
+
+Seven pretrained face-embedding models were evaluated with two complementary benchmarks. Both use the gallery
+embeddings as templates and the probes as test images.
+
+- **MLP classification:** an MLP is trained on the L2-normalised embeddings with grid search and 5-fold CV.
+  This measures how separable the embedding space is.
+- **Cosine Rank-1 identification:** each probe is matched against the gallery with cosine similarity. This is the
+  metric that matters operationally, because the system matches embeddings directly.
 
 | Model | Cosine Rank-1 | MLP accuracy |
 |-------|:-------------:|:------------:|
@@ -70,66 +100,123 @@ All numbers come from the original run of the experiments described in the repor
 | SFace¹ | 97.22% | 94.44% |
 | VGG-Face¹ | 94.17% | 94.72% |
 
-¹ *DeepFace models. In the original run they received RGB instead of BGR images, so their scores are likely
-underestimated (see [Code review & fixes](#code-review--fixes)).*
+¹ *DeepFace models. In this run they received RGB instead of the BGR images DeepFace expects (now fixed in the code),
+so their scores are likely underestimated.*
 
-### Matching thresholds (selected with K = 3)
+**InceptionResnetV1-VGGFace2** was selected. It has the best cosine Rank-1 accuracy and extracts embeddings about
+30× faster than ArcFace (4.04 s against 120.58 s for 520 faces). VGGFace2 is also a larger and more diverse training
+set than CASIA-WebFace, which favours generalisation in the wild.
 
-| Threshold | Value | Calibration rule |
-|-----------|:-----:|------------------|
-| Verification `Tv` | 0.6013 | min t such that all-pairs impostor FAR ≤ 0.1%, then a −0.045 usability bias |
-| Identification `Ti` | 0.6833 | min t such that max-impostor (open-set) FAR ≤ 0.1% |
-| Liveness `Tf` | 0.5 | Scores are saturated near 0 and 1, so the EER offers no gain over 0.5 |
-| Quality `Tq` | 20.264 | ERC analysis (the report shows 20.364, which is a typo) |
+> In the original run the model was ranked on the probe set, which is also the final test set, so the probe metrics
+> are slightly optimistic. The code now ranks the models with cross-validation on the gallery only.
 
-### System performance on the probe set
+<p align="center">
+  <img src="docs/figures/confusion_matrix_vggface2.png" alt="Confusion matrix" width="48%">
+  <img src="docs/figures/similarity_matrix_vggface2.png" alt="Subject similarity matrix" width="48%"><br>
+  <em>InceptionResnetV1-VGGFace2 on the probe set. Left: normalised confusion matrix. Right: average cosine similarity between subjects.</em>
+</p>
+
+---
+
+## 4. Threshold tuning (`Ti`, `Tv`)
+
+Similarity scores are turned into decisions with two thresholds:
+
+- **`Tv` (verification, 1:1)** is set on the dense distribution of **all impostor pairs**:
+  `Tv = min{t : FAR(t) ≤ 0.1%}`, then a −0.045 bias makes it slightly more permissive for usability.
+- **`Ti` (open-set identification, 1:N)** is set on the **maximum impostor score** of each probe. This models the
+  worst case, an unknown person who looks like an enrolled one: `Ti = min{t : FAR_max(t) ≤ 0.1%}`.
+
+The thresholds are calibrated **on the gallery only**, with image-disjoint stratified K-fold cross-validation: in
+each fold, K−1 folds act as the gallery and the remaining fold acts as probes. The threshold is swept from 0 to 1 in
+steps of 0.001 and averaged across folds. The probe set is not used here.
+
+| K | Verification FAR | Verification FRR | Identification FNIR | Open-set FAR | `Tv` | `Ti` |
+|:-:|:----------------:|:----------------:|:-------------------:|:------------:|:----:|:----:|
+| **3** | 0.37% | 0.72% | 0% | 0% | **0.6013** | **0.6833** |
+| 4 | 0.36% | 0.83% | 0% | 0% | 0.6020 | 0.6770 |
+| 5 | 0.39% | 0.90% | 0% | 0% | 0.6096 | 0.6756 |
+
+**K = 3** was selected because it gives the lowest error rates and the most stable thresholds across folds
+(std(`Tv`) = 0.0005, std(`Ti`) = 0.0066).
+
+**Results on the probe set (test):**
 
 | Task | Metric | Value |
 |------|--------|:-----:|
-| Verification (1:1, 2 880 genuine and 54 720 impostor comparisons) | FAR / FRR | **0.21% / 2.29%** |
-| Identification (1:N, closed set) | Rank-1 identification rate (DIR) | **99.17%** |
+| Verification (2 880 genuine and 54 720 impostor comparisons) | FAR / FRR | **0.21% / 2.29%** |
+| Identification (closed set) | Rank-1 identification rate (DIR) | **99.17%** |
 | | FNIR (miss rate) | 0.83% |
 | Identification (open set, each subject removed from the gallery in turn) | Open-set FAR | 0.83% |
 | Rank-1 and Rank-2 identification at `Ti` | FAR / FRR | 0.00% / 0.83% (Rank-2 equals Rank-1) |
-| Liveness (held-out subjects) | Accuracy, False Live Rate, False Fake Rate | 100% / 0% / 0% |
+
+The probes contain harder lighting than the gallery, so a slight degradation with respect to the cross-validation
+results was expected. The 0.83% FRR comes from genuine probes that were ranked first but scored just below `Ti`; there are
+no ranking errors.
 
 <p align="center">
   <img src="docs/figures/test_set_score_distributions.png" alt="Score distributions and error curves on the probe set" width="100%"><br>
   <em>Probe set: genuine and impostor score distributions and error curves for verification (left) and identification (right).</em>
 </p>
 
-<p align="center">
-  <img src="docs/figures/confusion_matrix_vggface2.png" alt="Confusion matrix" width="48%">
-  <img src="docs/figures/quality_erc_curve.png" alt="ERC curve" width="48%"><br>
-  <em>Left: normalised confusion matrix (InceptionResnetV1-VGGFace2, probe set). Right: Error-vs-Reject Characteristic used to choose the MagFace quality threshold (original run).</em>
-</p>
+---
+
+## 5. Liveness detection (`Tf`)
+
+The replay-attack detector ([`liveness_detector.py`](liveness_detector.py)) is a **MobileNetV2** initialised with
+ImageNet weights and **fully fine-tuned**. Its 1000-class head is replaced by a single liveness logit.
+
+- **Input:** the same MTCNN face crops the live system produces, so training matches deployment.
+- **Split:** 60/20/20 train/validation/test, **subject-disjoint** (`GroupShuffleSplit` on the subject), so a
+  subject's real images and their re-captured fakes always fall in the same split.
+- **Training:** binary cross-entropy with logits (numerically more stable than sigmoid + BCE), at most 30 epochs,
+  early stopping on validation loss with patience 10. The checkpoint with the best validation accuracy is kept.
+
+Validation accuracy reached 100% with a validation loss of 0.0057 after 6 epochs, and the test set also scored
+**100%** (0% False Live Rate, 0% False Fake Rate). The output probabilities are almost always exactly 0 or 1.
+
+**Threshold `Tf`.** The Equal Error Rate was first estimated with 4-fold cross-validation, but the saturated score
+distribution makes every threshold in the central range equivalent. The neutral value **`Tf = 0.5`** was adopted.
 
 <p align="center">
   <img src="docs/figures/liveness_training_curves.png" alt="Liveness training curves" width="70%"><br>
-  <em>Liveness detector training: loss and accuracy on training and validation (early stopping on validation loss).</em>
+  <em>Training and validation loss and accuracy of the liveness detector.</em>
 </p>
-
-More figures are in [`docs/figures`](docs/figures): per-fold threshold tuning, the subject similarity matrix,
-the model comparison and the liveness test-set analysis.
 
 ---
 
-## Methodology highlights
+## 6. Image quality (`Tq`)
 
-- **Threshold calibration without test leakage.** `Tv` and `Ti` are estimated with image-disjoint
-  stratified K-fold cross-validation on the gallery (K ∈ {3, 4, 5}). In each fold, K−1 folds act as the gallery
-  and one fold acts as probes. The probes are used only once, for the final evaluation.
-- **Two threat models.** Verification uses the dense distribution of *all* impostor pairs. Open-set identification
-  uses the *maximum* impostor score per probe, which models the worst case of an unknown person who looks like an
-  enrolled one.
-- **Quality as utility.** MagFace scores each face and the recognition model measures the resulting error. The
-  ERC curve (FNMR at FMR = 0.1% against the rejection ratio) selects the strictest quality gate that does not
-  hurt accuracy.
-- **Liveness without leakage.** Each subject's genuine images and their re-captured fakes always fall in the same
-  split (`GroupShuffleSplit` on the subject).
-- **Behaviour of a real system.** The quality gate discards poor samples and asks for re-acquisition. Enrollment
-  stores the features of every accepted sample and never the images. Verification compares the probe only with the
-  claimed user's templates. Identification returns the ranked list of candidates above `Ti`.
+The acquisition module rejects low-quality samples before matching and asks the user for a new acquisition
+([`face_quality.py`](face_quality.py)).
+
+- **Quality measure: MagFace.** General image-quality metrics such as sharpness or noise correlate poorly with
+  recognition accuracy. MagFace instead learns embeddings whose **magnitude** grows with the sample's recognisability,
+  so the norm of its feature measures *biometric utility*. Faces are aligned to the 112×112 MagFace template with the
+  5 MTCNN landmarks.
+- **Hybrid ERC analysis.** MagFace only provides the quality score. The error is measured with the system's own
+  recognition model (InceptionResnetV1-VGGFace2), so the threshold reflects the real system's accuracy.
+- **Error-vs-Reject Characteristic.** Samples are sorted by quality and the lowest R% are discarded, for R from 0% to
+  50% in steps of 1%. For each R, the FNMR at a fixed FMR of 0.1% is computed on the surviving samples.
+- **Selection (anchor and refine).** The anchor is the first rejection ratio that reaches the target error. The
+  algorithm then picks the strictest quality threshold whose error stays within a tolerance of the anchor, with a
+  hard limit of 30% rejected samples.
+
+The selected threshold is **`Tq = 20.264`**, which rejects 29% of the samples with an expected FNMR of 2.39%.
+(The report shows 20.364, which is a typo.)
+
+> In the original run the ERC was computed on the probe set. The code now calibrates `Tq` with cross-validation on the
+> gallery and uses the probes only to assess the result. The refinement tolerance is absolute
+> (`refine_tolerance=0.05` means +5 FNMR points), so with this value the selected ratio tends to sit just below the
+> 30% cap. A smaller tolerance rejects fewer samples.
+
+<p align="center">
+  <img src="docs/figures/quality_erc_curve.png" alt="ERC curve" width="70%"><br>
+  <em>Error-vs-Reject Characteristic used to select the MagFace quality threshold (original run, probe set).</em>
+</p>
+
+More figures are in [`docs/figures`](docs/figures): per-fold threshold tuning, the model comparison and the liveness
+test-set analysis.
 
 ---
 
@@ -180,30 +267,6 @@ pip install -r requirements.txt
 
 ---
 
-## Code review & fixes
-
-Before publication the code was reviewed and the following issues were fixed. The dataset is no longer available,
-so the affected notebook cells have **not been re-run yet** and still show the outputs of the original code.
-
-| Issue | Impact on the reported results |
-|-------|--------------------------------|
-| DeepFace models (ArcFace, Facenet512, VGG-Face, GhostFaceNet, SFace) received **RGB** crops, while DeepFace expects **BGR** | Their benchmark scores are probably underestimated. InceptionResnetV1 (the selected model) and every later stage are **not affected** |
-| The feature extractor was selected, and the quality threshold calibrated, **on the probe set** that is also used for the final evaluation | Small optimistic bias in the final metrics. Both are now done with cross-validation on the gallery only |
-| The standard deviations of `Tv` and `Ti` were **swapped** when the tuning results were unpacked | Only the reported std is affected (for K = 3: std(`Tv`) = 0.0005, std(`Ti`) = 0.0066). The thresholds and the choice of K are unchanged |
-| The quality "gate" always kept the best sample, even below the threshold | Fixed: samples below the threshold are discarded and re-acquisition is requested |
-| Verification printed comparisons against the whole gallery. Identification returned only the top-1 match | Fixed according to the system specification |
-| Faces and file paths could become misaligned when a detection failed | Fixed: `detect_faces` returns the paths of the kept images |
-| The plotted "FNIR" curve reused the image-level FRR | The curve is now the per-probe Rank-1 miss rate (plots only, the thresholds are not affected) |
-
-Also fixed: `sys.exit()` calls inside library code, a missing branch in `compute_fnmr_at_fmr`, unsafe `torch.load`
-calls, duplicated and unused code, and heavy imports (DeepFace/TensorFlow, dlib) that are now loaded only when needed.
-
-The ERC refinement step uses an **absolute** tolerance (`refine_tolerance=0.05`, i.e. +5 FNMR points around the
-anchor). With this value the selected rejection ratio tends to sit just below the 30% cap. A smaller tolerance
-keeps the error closer to the anchor and rejects fewer samples.
-
----
-
 ## Limitations and future work
 
 - **Small dataset** (20 subjects, 520 images). The very low error rates need to be confirmed on larger,
@@ -211,7 +274,7 @@ keeps the error closer to the anchor and rejects fewer samples.
 - **Liveness generalisation.** The 100% accuracy covers screen replays captured with the same devices. Cues
   specific to the acquisition device may be part of what the model learned. Next steps: cross-device tests,
   print and video attacks, and public anti-spoofing benchmarks (e.g. Replay-Attack, OULU-NPU).
-- **Rejection rate.** With the current quality threshold about 29% of the probes are rejected. A real
+- **Rejection rate.** With the current quality threshold about 29% of the samples are rejected. A real
   deployment would call for a gentler quality gate or for guidance during acquisition.
 - **Future engineering work:** a packaged module with a config file, unit tests and CI, webcam acquisition,
   and an ONNX/TFLite export for on-device inference.
