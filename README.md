@@ -254,8 +254,10 @@ python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\act
 pip install -r requirements.txt
 ```
 
-1. **Model weights.** Follow [`models/README.md`](models/README.md) to get `magface_iresnet50_MS1MV2_ddp_fp32.pth`
-   and `liveness_model.pth`.
+1. **Model weights.** Download the MagFace weights (`magface_iresnet50_MS1MV2_ddp_fp32.pth`) as described in
+   [`models/README.md`](models/README.md). The liveness weights (`liveness_model.pth`) are **not distributed**,
+   because they were trained on the faces of the dataset subjects. You can train your own with
+   `notebooks/01_face_authentication.ipynb`, or run the demo with the liveness detector bypassed.
 2. **Gallery.** Enroll users with the demo (Enrollment mode), or build the gallery from a dataset with
    `notebooks/01_face_authentication.ipynb`. The dataset must have this layout:
    ```
@@ -264,12 +266,12 @@ pip install -r requirements.txt
    ```
 3. **Run the demo** in `notebooks/02_system_demo.ipynb`, or from the command line. Put up to 3 pictures of the user in a folder:
    ```bash
-   python face_auth/live_system_demo.py enroll   --data-dir Test/alice --name alice
-   python face_auth/live_system_demo.py identify --data-dir Test/alice
-   python face_auth/live_system_demo.py verify   --data-dir Test/alice --claimed-id 0
-   python face_auth/live_system_demo.py identify --data-dir Test/alice --no-liveness   # bypass the liveness detector
+   python face_auth/live_system_demo.py enroll   --data-dir Test/alice --name alice --no-liveness
+   python face_auth/live_system_demo.py identify --data-dir Test/alice --no-liveness
+   python face_auth/live_system_demo.py verify   --data-dir Test/alice --claimed-id 0 --no-liveness
    ```
-   Each run prints the decision and the processing time of every stage. If no sample passes the liveness or
+   Drop `--no-liveness` to enable the replay-attack detector once `models/liveness_model.pth` is available. The demo
+   notebook enables it automatically when the weights are present. Each run prints the decision and the processing time of every stage. If no sample passes the liveness or
    quality checks, it asks for a new acquisition.
 
 ---

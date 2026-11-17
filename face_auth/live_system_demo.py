@@ -250,8 +250,13 @@ def load_models(cfg, device, use_liveness=True):
     magface = face_quality.MagFaceEvaluator(os.path.join(cfg["model_dir"], cfg["magface_model_name"]), device=device)
     liveness_model = None
     if use_liveness:
-        liveness_model = liveness_detector.load_liveness_model(
-            os.path.join(cfg["model_dir"], cfg["liveness_model_name"]), device)
+        liveness_path = os.path.join(cfg["model_dir"], cfg["liveness_model_name"])
+        if not os.path.exists(liveness_path):
+            raise FileNotFoundError(
+                f"Liveness weights not found at '{liveness_path}'. They are not distributed with the repository "
+                "(see models/README.md): train them with notebooks/01_face_authentication.ipynb or run the demo "
+                "with the liveness detector bypassed (--no-liveness / USE_LIVENESS = False).")
+        liveness_model = liveness_detector.load_liveness_model(liveness_path, device)
     return magface, liveness_model
 
 
@@ -268,7 +273,11 @@ def main():
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     use_liveness = not args.no_liveness
-    magface, liveness_model = load_models(DEFAULT_CONFIG, device, use_liveness)
+    try:
+        magface, liveness_model = load_models(DEFAULT_CONFIG, device, use_liveness)
+    except FileNotFoundError as e:
+        print(f">> ERROR: {e}")
+        return
     mode = {"enroll": "Enrollment", "identify": "Identification", "verify": "Verification"}[args.mode]
     try:
         run_session(mode, args.data_dir, DEFAULT_CONFIG["embedding_model"], device, magface, liveness_model,
